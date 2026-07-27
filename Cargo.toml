@@ -4,10 +4,6 @@ members = [
     "niri-ipc",
     "niri-visual-tests",
 ]
-exclude = [
-    "vendor/smithay",
-    "vendor/niri-hdr-ref",
-]
 
 [workspace.package]
 version = "26.4.0"
@@ -32,12 +28,14 @@ tracy-client = { version = "0.18.4", default-features = false }
 [workspace.dependencies.smithay]
 # HDR / color-management fork (wp-color-management-v1 + connector color state).
 # Track Smithay#1143 / cosmic-comp and rebase when upstream lands.
-# Local checkout with Windows-scRGB + PQ scanout fixes (based on dividebysandwich/smithay).
-path = "vendor/smithay"
+# Windows-scRGB + PQ scanout fixes on top of dividebysandwich/smithay.
+git = "https://github.com/LewisTansley/smithay.git"
+rev = "e93fe1bd0dde016345b520b2f115b617900ecac9"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
-path = "vendor/smithay/smithay-drm-extras"
+git = "https://github.com/LewisTansley/smithay.git"
+rev = "e93fe1bd0dde016345b520b2f115b617900ecac9"
 
 [package]
 name = "niri"
