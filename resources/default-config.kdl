@@ -104,6 +104,13 @@ input {
     // If the position is unset or results in an overlap, the output is instead placed
     // automatically.
     position x=1280 y=0
+
+    // Opt into HDR (BT.2020 + PQ). Requires a capable GPU/display. See the wiki.
+    // hdr mode="on" {
+    //     reference-luminance 203
+    //     max-nits 1000
+    //     max-average-luminance 400
+    // }
 }
 
 // Settings that influence how windows are positioned and sized.

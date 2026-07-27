@@ -1,4 +1,7 @@
 /target
+/target-*
 /result
+/vendor
+/.tmp
 
 .idea

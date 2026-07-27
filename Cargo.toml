@@ -4,6 +4,10 @@ members = [
     "niri-ipc",
     "niri-visual-tests",
 ]
+exclude = [
+    "vendor/smithay",
+    "vendor/niri-hdr-ref",
+]
 
 [workspace.package]
 version = "26.4.0"
@@ -26,16 +30,14 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracy-client = { version = "0.18.4", default-features = false }
 
 [workspace.dependencies.smithay]
-# version = "0.4.1"
-git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+# HDR / color-management fork (wp-color-management-v1 + connector color state).
+# Track Smithay#1143 / cosmic-comp and rebase when upstream lands.
+# Local checkout with Windows-scRGB + PQ scanout fixes (based on dividebysandwich/smithay).
+path = "vendor/smithay"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
-# version = "0.1.0"
-git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
-# path = "../smithay/smithay-drm-extras"
+path = "vendor/smithay/smithay-drm-extras"
 
 [package]
 name = "niri"
@@ -73,7 +75,7 @@ glam = "0.32.1"
 input = { version = "0.10.0", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.185"
-libdisplay-info = "0.3.0"
+libdisplay-info = { version = "0.3.0", features = ["v0_2"] }
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }

@@ -62,6 +62,8 @@ pub struct Output {
     #[knuffel(child, unwrap(argument))]
     pub max_bpc: Option<MaxBpc>,
     #[knuffel(child)]
+    pub hdr: Option<Hdr>,
+    #[knuffel(child)]
     pub mode: Option<Mode>,
     #[knuffel(child)]
     pub modeline: Option<Modeline>,
@@ -104,6 +106,7 @@ impl Default for Output {
             transform: Transform::Normal,
             position: None,
             max_bpc: None,
+            hdr: None,
             mode: None,
             modeline: None,
             variable_refresh_rate: None,
@@ -138,6 +141,66 @@ pub struct MaxBpc(pub niri_ipc::MaxBpc);
 pub struct Vrr {
     #[knuffel(property, default = false)]
     pub on_demand: bool,
+}
+
+/// HDR (high dynamic range) output configuration.
+///
+/// Presence of the `hdr` node enables HDR signalling on the output: niri will request a 10-bit (or
+/// wider) scanout buffer, set the connector `Colorspace` to BT.2020 RGB, and attach an
+/// `HDR_OUTPUT_METADATA` infoframe advertising the PQ (SMPTE ST 2084) transfer function. This is
+/// only acted upon for outputs whose driver exposes the corresponding DRM connector properties.
+///
+/// With `mode="on"` (recommended for mixed desktop use), tiled and windowed SDR and HDR clients
+/// share one HDR container: SDR is encoded at [`Self::reference_luminance`], and HDR content is
+/// reference-matched then ICtCp-tonemapped against [`Self::max_nits`].
+#[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
+pub struct Hdr {
+    /// When HDR engages on this output.
+    #[knuffel(property, str, default)]
+    pub mode: HdrMode,
+    /// Luminance, in cd/m² (nits), that SDR white (the value 1.0) is mapped to while the output is
+    /// in HDR mode. Also used to match PQ content's reference white (203 nits) to the same paper
+    /// white. Defaults to 203 cd/m² (BT.2408) when unset. Corresponds to KDE's Max SDR luminance.
+    #[knuffel(child, unwrap(argument))]
+    pub reference_luminance: Option<FloatOrInt<0, 10000>>,
+    /// Display peak luminance in cd/m² (nits). Overrides EDID `max_cll` / max luminance for DRM
+    /// metadata, client feedback, and the ICtCp tonemap shoulder. Corresponds to KDE's Peak HDR
+    /// luminance. Falls back to EDID, then 500, when unset.
+    #[knuffel(child, unwrap(argument))]
+    pub max_nits: Option<FloatOrInt<0, 10000>>,
+    /// Optional max frame-average luminance (MaxFALL) in cd/m². Written into
+    /// `HDR_OUTPUT_METADATA` and advertised to clients. Falls back to EDID `max_fall`, then
+    /// [`Self::max_nits`] / EDID peak, when unset.
+    #[knuffel(child, unwrap(argument))]
+    pub max_average_luminance: Option<FloatOrInt<0, 10000>>,
+}
+
+/// When HDR engages on an `hdr`-enabled output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HdrMode {
+    /// HDR is signalled while any mapped surface with an HDR image description is visible on the
+    /// output, and the output stays SDR otherwise. Entering/leaving HDR may modeset (brief blank).
+    #[default]
+    Auto,
+    /// The output is always in HDR: the connector stays in BT.2020 + PQ, SDR content is
+    /// composited into the HDR blend space, and clients are told upfront that the output prefers
+    /// PQ/BT.2020 content — so applications that only probe HDR support once at startup (e.g.
+    /// many SDL games) detect it. Preferred for mixed tiled/windowed SDR + HDR.
+    On,
+}
+
+impl std::str::FromStr for HdrMode {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "on" => Ok(Self::On),
+            _ => Err(miette::miette!(
+                r#"invalid HDR mode, can be "auto" or "on""#
+            )),
+        }
+    }
 }
 
 impl FromIterator<Output> for Outputs {

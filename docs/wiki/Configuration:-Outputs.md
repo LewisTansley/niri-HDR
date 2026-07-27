@@ -16,6 +16,7 @@ output "eDP-1" {
     focus-at-startup
     backdrop-color "#001100"
     // max-bpc 8
+    // hdr
 
     hot-corners {
         // off
@@ -298,6 +299,51 @@ Valid values are `6`, `8`, `10`, `12`, `14`, `16`.
 // Set 8 max-bpc on HDMI-A-1 to lower the bandwidth.
 output "HDMI-A-1" {
     max-bpc 8
+}
+```
+
+### `hdr`
+
+> [!CAUTION]
+> HDR support is experimental. Prefer `mode="on"` for mixed tiled/windowed SDR and HDR content.
+
+Opts this output into HDR. When present, niri:
+
+- advertises the `wp-color-management-v1` protocol to clients;
+- requests a 10-bit (or wider) scanout buffer, and at least 10 `max-bpc`;
+- signals BT.2020 + PQ on the connector while HDR is active;
+- composites SDR and HDR clients into one HDR container using paper-white reference matching
+  and ICtCp tonemapping against `max-nits`.
+
+With no `hdr` node on any output, color management is not advertised and behavior is unchanged.
+HDR signalling only works on the TTY backend.
+
+The optional `mode` property:
+
+- `mode="auto"` (default): enter HDR while any mapped surface with an HDR image description is
+  visible on the output (not only fullscreen). Expect a brief modeset blank when entering/leaving.
+- `mode="on"`: always HDR. Recommended for mixed desktop use and games that probe HDR once at startup.
+
+Children (all luminances in cd/m² / nits):
+
+- `reference-luminance` — SDR white / paper white (KDE Max SDR luminance). Default 203 (BT.2408).
+- `max-nits` — display peak (KDE Peak HDR luminance). Overrides EDID for metadata, client feedback,
+  and the tonemap shoulder. Falls back to EDID, then 500.
+- `max-average-luminance` — optional MaxFALL. Falls back to EDID, then `max-nits`.
+
+Screenshots and screencasts of HDR outputs are tone-mapped to SDR.
+
+```kdl
+output "eDP-1" {
+    hdr
+}
+
+output "DP-1" {
+    hdr mode="on" {
+        reference-luminance 300
+        max-nits 1000
+        max-average-luminance 400
+    }
 }
 ```
 
