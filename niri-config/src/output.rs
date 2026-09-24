@@ -151,18 +151,25 @@ pub struct Vrr {
 /// only acted upon for outputs whose driver exposes the corresponding DRM connector properties.
 ///
 /// With `mode="on"` (recommended for mixed desktop use), tiled and windowed SDR and HDR clients
-/// share one HDR container: SDR is encoded at [`Self::reference_luminance`], and HDR content is
-/// reference-matched then ICtCp-tonemapped against [`Self::max_nits`].
+/// share one HDR container: SDR is encoded at [`Self::sdr_brightness`] (or
+/// [`Self::reference_luminance`] when unset), and HDR content is reference-matched then
+/// ICtCp-tonemapped against [`Self::max_nits`].
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
 pub struct Hdr {
     /// When HDR engages on this output.
     #[knuffel(property, str, default)]
     pub mode: HdrMode,
-    /// Luminance, in cd/m² (nits), that SDR white (the value 1.0) is mapped to while the output is
-    /// in HDR mode. Also used to match PQ content's reference white (203 nits) to the same paper
-    /// white. Defaults to 203 cd/m² (BT.2408) when unset. Corresponds to KDE's Max SDR luminance.
+    /// Paper-white luminance in cd/m² (nits) used to match PQ content's reference white (203 nits)
+    /// and advertised to clients. Also used as the SDR encode target when
+    /// [`Self::sdr_brightness`] is unset. Defaults to 203 cd/m² (BT.2408). Corresponds to KDE's
+    /// Max SDR luminance when used alone.
     #[knuffel(child, unwrap(argument))]
     pub reference_luminance: Option<FloatOrInt<0, 10000>>,
+    /// Absolute luminance in cd/m² (nits) for SDR windows and compositor SDR UI in the HDR blend.
+    /// Does not scale PQ HDR or Windows-scRGB / ExtLinear content. When unset, SDR uses
+    /// [`Self::reference_luminance`] (or 203).
+    #[knuffel(child, unwrap(argument))]
+    pub sdr_brightness: Option<FloatOrInt<0, 10000>>,
     /// Display peak luminance in cd/m² (nits). Overrides EDID `max_cll` / max luminance for DRM
     /// metadata, client feedback, and the ICtCp tonemap shoulder. Corresponds to KDE's Peak HDR
     /// luminance. Falls back to EDID, then 500, when unset.

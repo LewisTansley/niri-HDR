@@ -748,6 +748,7 @@ mod tests {
                 max-bpc 10
                 hdr mode="on" {
                     reference-luminance 203
+                    sdr-brightness 400
                     max-nits 1000
                     max-average-luminance 400
                 }
@@ -1177,6 +1178,11 @@ mod tests {
                                 reference_luminance: Some(
                                     FloatOrInt(
                                         203.0,
+                                    ),
+                                ),
+                                sdr_brightness: Some(
+                                    FloatOrInt(
+                                        400.0,
                                     ),
                                 ),
                                 max_nits: Some(

@@ -108,6 +108,8 @@ input {
     // Opt into HDR (BT.2020 + PQ). Requires a capable GPU/display. See the wiki.
     // hdr mode="on" {
     //     reference-luminance 203
+    //     // Raise only SDR windows / UI (nits); leave unset to follow reference-luminance.
+    //     // sdr-brightness 400
     //     max-nits 1000
     //     max-average-luminance 400
     // }

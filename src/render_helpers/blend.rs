@@ -2,13 +2,16 @@
 //!
 //! An output is either SDR (electrical sRGB, the default) or HDR (the framebuffer holds
 //! PQ/BT.2020 electrical values and the connector is signalled accordingly). On HDR outputs:
-//! - SDR content is encoded into the blend space at the configured paper-white luminance
+//! - SDR content is encoded into the blend space at `sdr_brightness` (or `reference_luminance`
+//!   when unset)
 //! - PQ HDR content is reference-matched then ICtCp-tonemapped against `max_nits`
 //! - extended-linear / Windows-scRGB content is scaled to reference white then tonemapped
 //!
 //! Blending happens directly in PQ-encoded space (same approximation as sRGB-space blending).
 
 use std::cell::Cell;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
@@ -32,6 +35,9 @@ pub const DEFAULT_REFERENCE_LUMINANCE: f64 = 203.;
 #[cfg(test)]
 const PQ_REFERENCE_LUMINANCE: f64 = 203.;
 
+/// HDR frame blend luminances in cd/m²: `(reference_luminance, max_nits, sdr_brightness)`.
+pub type BlendLuminances = (f64, f64, f64);
+
 /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
 /// data (like [`super::shaders::Shaders`]).
 #[derive(Debug, Default)]
@@ -39,6 +45,7 @@ pub struct FrameBlendState {
     hdr_pq: Cell<bool>,
     ref_lum_scale: Cell<f32>,
     max_nit_scale: Cell<f32>,
+    sdr_lum_scale: Cell<f32>,
 }
 
 impl FrameBlendState {
@@ -55,24 +62,27 @@ impl FrameBlendState {
             .expect("FrameBlendState::init() must be called when creating the renderer")
     }
 
-    /// Marks frames as HDR with `(reference_luminance, max_nits)` in cd/m², or SDR (`None`).
-    pub fn set(renderer: &mut GlesRenderer, luminances: Option<(f64, f64)>) {
+    /// Marks frames as HDR with `(reference_luminance, max_nits, sdr_brightness)` in cd/m², or
+    /// SDR (`None`).
+    pub fn set(renderer: &mut GlesRenderer, luminances: Option<BlendLuminances>) {
         let state = Self::get(renderer);
         match luminances {
-            Some((ref_lum, max_nits)) => {
+            Some((ref_lum, max_nits, sdr_brightness)) => {
                 state.hdr_pq.set(true);
                 state.ref_lum_scale.set((ref_lum / 10000.) as f32);
                 state.max_nit_scale.set((max_nits / 10000.) as f32);
+                state.sdr_lum_scale.set((sdr_brightness / 10000.) as f32);
             }
             None => {
                 state.hdr_pq.set(false);
                 state.ref_lum_scale.set(0.);
                 state.max_nit_scale.set(0.);
+                state.sdr_lum_scale.set(0.);
             }
         }
     }
 
-    fn values_from_frame(frame: &GlesFrame) -> (bool, f32, f32) {
+    fn values_from_frame(frame: &GlesFrame) -> (bool, f32, f32, f32) {
         let state: &Self = frame
             .egl_context()
             .user_data()
@@ -82,17 +92,18 @@ impl FrameBlendState {
             state.hdr_pq.get(),
             state.ref_lum_scale.get(),
             state.max_nit_scale.get(),
+            state.sdr_lum_scale.get(),
         )
     }
 
     /// Uniforms for SDR (or compositor-drawn) content in this frame.
-    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 8] {
+    pub fn uniforms(frame: &GlesFrame) -> [Uniform<'static>; 9] {
         Self::uniforms_for_content(frame, ContentKind::Sdr)
     }
 
     /// Uniforms for a draw in this frame.
-    pub fn uniforms_for_content(frame: &GlesFrame, kind: ContentKind) -> [Uniform<'static>; 8] {
-        let (hdr_pq, ref_scale, max_scale) = Self::values_from_frame(frame);
+    pub fn uniforms_for_content(frame: &GlesFrame, kind: ContentKind) -> [Uniform<'static>; 9] {
+        let (hdr_pq, ref_scale, max_scale, sdr_scale) = Self::values_from_frame(frame);
         let apply = hdr_pq && !matches!(kind, ContentKind::Passthrough);
         let content_hdr = matches!(kind, ContentKind::Hdr { .. });
         let content_peak = match kind {
@@ -109,6 +120,7 @@ impl FrameBlendState {
             Uniform::new("niri_hdr_pq", if apply { 1.0f32 } else { 0.0 }),
             Uniform::new("niri_ref_lum_scale", ref_scale),
             Uniform::new("niri_max_nit_scale", max_scale),
+            Uniform::new("niri_sdr_lum_scale", sdr_scale),
             Uniform::new("niri_content_hdr", if content_hdr { 1.0f32 } else { 0.0 }),
             Uniform::new("niri_content_peak", content_peak),
             Uniform::new("niri_linear", if linear { 1.0f32 } else { 0.0 }),
@@ -200,22 +212,52 @@ pub fn is_fp16_fourcc(code: smithay::backend::allocator::Fourcc) -> bool {
     )
 }
 
-/// Resolves content kind from the image description, then applies the FP16+PQ mistag
-/// heuristic: real HDR10 is 10-bit UNORM; FP16 swapchains on Windows/DXVK are scRGB.
+/// Distinct `(fourcc, tagged, kind)` combinations already logged by [`log_content_kind`].
+static LOGGED_CONTENT_KINDS: OnceLock<Mutex<HashSet<(Option<u32>, bool, &'static str)>>> =
+    OnceLock::new();
+
+/// Logs each distinct buffer classification once; this runs per surface per frame.
+fn log_content_kind(
+    tagged: bool,
+    buffer_fourcc: Option<smithay::backend::allocator::Fourcc>,
+    kind: ContentKind,
+) {
+    let label = match kind {
+        ContentKind::Sdr => "sdr",
+        ContentKind::Hdr { .. } => "hdr-pq",
+        ContentKind::Linear { .. } => "linear-scrgb",
+        ContentKind::Passthrough => "passthrough",
+    };
+
+    let logged = LOGGED_CONTENT_KINDS.get_or_init(Default::default);
+    if !logged
+        .lock()
+        .unwrap()
+        .insert((buffer_fourcc.map(|code| code as u32), tagged, label))
+    {
+        return;
+    }
+
+    debug!("buffer content kind: fourcc={buffer_fourcc:?} tagged={tagged} kind={kind:?}");
+}
+
+/// Resolves content kind from the image description, then applies the FP16 heuristic: real
+/// HDR10 is 10-bit UNORM, so an FP16 swapchain is extended-linear no matter how (or whether)
+/// the client tagged it. Windows/DXVK scRGB buffers often arrive untagged, and reading those
+/// as electrical sRGB overflows the PQ encode at highlights.
 pub fn content_kind_for_buffer(
     desc: Option<ImageDescription>,
     buffer_fourcc: Option<smithay::backend::allocator::Fourcc>,
 ) -> ContentKind {
     let kind = content_kind_from_description(desc);
-    if matches!(kind, ContentKind::Hdr { .. })
-        && buffer_fourcc.is_some_and(is_fp16_fourcc)
+    let kind = if buffer_fourcc.is_some_and(is_fp16_fourcc)
+        && !matches!(kind, ContentKind::Linear { .. })
     {
-        debug!(
-            "PQ-tagged FP16 buffer; treating as scRGB linear (1.0 = {} nits) instead of PQ",
-            WINDOWS_LINEAR_REFERENCE_NITS
-        );
         ContentKind::Linear {
-            reference_nits: WINDOWS_LINEAR_REFERENCE_NITS,
+            reference_nits: desc
+                .as_ref()
+                .map(linear_reference_from_description)
+                .unwrap_or(WINDOWS_LINEAR_REFERENCE_NITS),
             peak_nits: desc
                 .as_ref()
                 .map(linear_peak_from_description)
@@ -223,7 +265,11 @@ pub fn content_kind_for_buffer(
         }
     } else {
         kind
-    }
+    };
+
+    log_content_kind(desc.is_some(), buffer_fourcc, kind);
+
+    kind
 }
 
 /// Configures the renderer for rendering into an SDR capture buffer from an HDR session:
@@ -244,14 +290,16 @@ pub fn set_sdr_capture_blend(renderer: &mut GlesRenderer, reference_luminance: f
     renderer.set_solid_color_transform(None);
 }
 
-/// Configures the renderer for `(reference_luminance, max_nits)` HDR blend, or SDR (`None`).
-pub fn set_frame_blend(renderer: &mut GlesRenderer, luminances: Option<(f64, f64)>) {
+/// Configures the renderer for `(reference_luminance, max_nits, sdr_brightness)` HDR blend, or
+/// SDR (`None`).
+pub fn set_frame_blend(renderer: &mut GlesRenderer, luminances: Option<BlendLuminances>) {
     FrameBlendState::set(renderer, luminances);
 
     match luminances {
-        Some((ref_lum, max_nits)) => {
+        Some((ref_lum, max_nits, sdr_brightness)) => {
             let ref_scale = (ref_lum / 10000.) as f32;
             let max_scale = (max_nits / 10000.) as f32;
+            let sdr_scale = (sdr_brightness / 10000.) as f32;
             let program = Shaders::get(renderer).texture_hdr.clone();
             if let Some(program) = program {
                 renderer.set_default_tex_program_override(Some((
@@ -260,6 +308,7 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, luminances: Option<(f64, f64
                         Uniform::new("niri_hdr_pq", 1.0f32),
                         Uniform::new("niri_ref_lum_scale", ref_scale),
                         Uniform::new("niri_max_nit_scale", max_scale),
+                        Uniform::new("niri_sdr_lum_scale", sdr_scale),
                         Uniform::new("niri_content_hdr", 0.0f32),
                         Uniform::new("niri_content_peak", 0.0f32),
                         Uniform::new("niri_linear", 0.0f32),
@@ -270,8 +319,9 @@ pub fn set_frame_blend(renderer: &mut GlesRenderer, luminances: Option<(f64, f64
             } else {
                 warn!("HDR texture shader missing; SDR content will render raw");
             }
+            // Solid colors and the default texture override are SDR-only paths.
             renderer
-                .set_solid_color_transform(Some(Box::new(move |color| srgb_to_pq(color, ref_scale))));
+                .set_solid_color_transform(Some(Box::new(move |color| srgb_to_pq(color, sdr_scale))));
         }
         None => {
             renderer.set_default_tex_program_override(None);
@@ -405,7 +455,7 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
         // the override converts HDR→SDR and must be kept as-is.
         let saved = match self.kind {
             ContentKind::Hdr { .. } | ContentKind::Linear { .. } => {
-                let (hdr_pq, _, _) = FrameBlendState::values_from_frame(frame);
+                let (hdr_pq, _, _, _) = FrameBlendState::values_from_frame(frame);
                 if hdr_pq {
                     let saved = frame.take_tex_program_override();
                     if let Some((program, _)) = saved.clone() {
@@ -459,7 +509,7 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         let gles_frame = frame.as_gles_frame();
         let saved = match self.kind {
             ContentKind::Hdr { .. } | ContentKind::Linear { .. } => {
-                let (hdr_pq, _, _) = FrameBlendState::values_from_frame(gles_frame);
+                let (hdr_pq, _, _, _) = FrameBlendState::values_from_frame(gles_frame);
                 if hdr_pq {
                     let saved = gles_frame.take_tex_program_override();
                     if let Some((program, _)) = saved.clone() {
@@ -510,6 +560,22 @@ mod tests {
 
         let half = srgb_to_pq(Color32F::new(0.5, 0.5, 0.5, 0.5), scale);
         assert!((half.r() - white.r() * 0.5).abs() < 0.0005);
+    }
+
+    #[test]
+    fn srgb_to_pq_uses_provided_sdr_scale() {
+        let ref_scale = (PQ_REFERENCE_LUMINANCE / 10000.) as f32;
+        let sdr_scale = (400. / 10000.) as f32;
+
+        let at_ref = srgb_to_pq(Color32F::new(1., 1., 1., 1.), ref_scale);
+        let at_sdr = srgb_to_pq(Color32F::new(1., 1., 1., 1.), sdr_scale);
+        // Higher absolute nits encode to a higher PQ code value.
+        assert!(
+            at_sdr.r() > at_ref.r() + 0.02,
+            "sdr 400 nits ({}) should be brighter than ref 203 ({})",
+            at_sdr.r(),
+            at_ref.r()
+        );
     }
 
     #[test]
@@ -586,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn content_kind_fp16_pq_heuristic() {
+    fn content_kind_fp16_heuristic() {
         use smithay::backend::allocator::Fourcc;
         use smithay::wayland::color::management::{Primaries, TransferFunction};
 
@@ -610,6 +676,25 @@ mod tests {
             content_kind_for_buffer(Some(pq), Some(Fourcc::Abgr2101010)),
             ContentKind::Hdr { peak_nits: 1000. }
         );
+
+        // Untagged and sRGB-tagged FP16 swapchains are scRGB too; reading them as electrical
+        // sRGB overflows the PQ encode and breaks hue at highlights.
+        let scrgb = ContentKind::Linear {
+            reference_nits: 80.,
+            peak_nits: 1000.,
+        };
+        assert_eq!(
+            content_kind_for_buffer(None, Some(Fourcc::Abgr16161616f)),
+            scrgb
+        );
+        assert_eq!(
+            content_kind_for_buffer(Some(ImageDescription::SRGB), Some(Fourcc::Xrgb16161616f)),
+            scrgb
+        );
+
+        // 8-bit buffers keep their tagged (or untagged) meaning.
+        assert_eq!(content_kind_for_buffer(None, Some(Fourcc::Xrgb8888)), ContentKind::Sdr);
+
         assert!(is_fp16_fourcc(Fourcc::Argb16161616f));
         assert!(!is_fp16_fourcc(Fourcc::Abgr2101010));
     }

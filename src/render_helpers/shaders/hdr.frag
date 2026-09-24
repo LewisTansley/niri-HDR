@@ -2,8 +2,9 @@
 //
 // Uniforms (defaults 0 = SDR passthrough):
 //   niri_hdr_pq          — 1.0 enables HDR blend-space transforms
-//   niri_ref_lum_scale   — reference_luminance / 10000 (paper white)
+//   niri_ref_lum_scale   — reference_luminance / 10000 (paper white / PQ match)
 //   niri_max_nit_scale   — max_nits / 10000 (display peak)
+//   niri_sdr_lum_scale   — sdr_brightness / 10000 (SDR encode only; 0 = use ref)
 //   niri_content_hdr     — 1.0 = source is PQ/BT.2020
 //   niri_content_peak    — content max luminance / 10000 (0 = skip tonemap)
 //   niri_linear          — >0.5 = extended-linear / scRGB
@@ -13,6 +14,7 @@
 uniform float niri_hdr_pq;
 uniform float niri_ref_lum_scale;
 uniform float niri_max_nit_scale;
+uniform float niri_sdr_lum_scale;
 uniform float niri_content_hdr;
 uniform float niri_content_peak;
 uniform float niri_linear;
@@ -76,6 +78,25 @@ float niri_tonemap_i(float intensity, float ref_i, float peak_i, float max_i) {
     return mix(ref_i, max_i, shaped);
 }
 
+// Pull RGB into [0, ∞) without inventing magenta: desaturate toward BT.2020 luminance
+// until every channel is non-negative (high-chroma + compressed I often yields negatives).
+vec3 niri_gamut_map_nonneg(vec3 rgb) {
+    float y = dot(rgb, vec3(0.2627, 0.6780, 0.0593));
+    float min_c = min(rgb.r, min(rgb.g, rgb.b));
+    if (min_c >= 0.0)
+        return rgb;
+    if (y <= 1e-10)
+        return vec3(0.0);
+    float t = clamp(y / (y - min_c), 0.0, 1.0);
+    return max(mix(vec3(y), rgb, t), vec3(0.0));
+}
+
+// Uniformly scale so max(R,G,B) ≤ max_scale — preserves hue unlike per-channel min().
+vec3 niri_scale_to_peak(vec3 rgb, float max_scale) {
+    float peak_c = max(rgb.r, max(rgb.g, rgb.b));
+    return rgb * (max_scale / max(peak_c, max_scale));
+}
+
 vec3 niri_tonemap_bt2020(vec3 lin, float ref_scale, float max_scale, float content_peak_scale) {
     if (content_peak_scale <= max_scale + 1e-8)
         return lin;
@@ -84,7 +105,7 @@ vec3 niri_tonemap_bt2020(vec3 lin, float ref_scale, float max_scale, float conte
     float max_i = niri_pq_oetf(vec3(max_scale)).x;
     float peak_i = niri_pq_oetf(vec3(content_peak_scale)).x;
     ictcp.x = niri_tonemap_i(ictcp.x, ref_i, peak_i, max_i);
-    return max(niri_ictcp_to_bt2020(ictcp), vec3(0.0));
+    return niri_gamut_map_nonneg(niri_ictcp_to_bt2020(ictcp));
 }
 
 vec4 niri_blend(vec4 color) {
@@ -121,15 +142,16 @@ vec4 niri_blend(vec4 color) {
         float lin_scale = niri_linear_scale > 0.0 ? niri_linear_scale : ref_scale;
         if (niri_hdr_pq > 0.5) {
             rgb = to_bt2020 * rgb;
-            rgb = max(rgb, vec3(0.0)) * lin_scale;
-            // Fixed mastering peak (metadata, floored to ≥4000 nits) so the curve always has
-            // headroom above typical panels. Never use per-pixel luminance as peak alone —
-            // that maps every specular to display max.
-            float peak = max(niri_content_peak, 0.4);
-            if (peak > max_scale) {
-                rgb = niri_tonemap_bt2020(rgb, ref_scale, max_scale, peak);
+            // scRGB can be slightly negative out-of-gamut; desaturate instead of zeroing a channel.
+            rgb = niri_gamut_map_nonneg(rgb) * lin_scale;
+            // Tonemap only when content peak exceeds the display (same rule as the PQ path).
+            // Do not floor peak to 4000 nits — that forced ICtCp crush on every scRGB game
+            // even when content/display are ~1000 nits (Windows-scRGB carries no max_cll).
+            if (niri_content_peak > max_scale) {
+                rgb = niri_tonemap_bt2020(rgb, ref_scale, max_scale, niri_content_peak);
             }
-            rgb = min(rgb, vec3(max_scale));
+            // Luminance-preserving peak limit (not per-channel min — that blooms pink/magenta).
+            rgb = niri_scale_to_peak(rgb, max_scale);
             rgb = niri_pq_oetf(rgb);
             return vec4(rgb * a, a);
         }
@@ -146,13 +168,19 @@ vec4 niri_blend(vec4 color) {
         if (niri_content_peak > max_scale) {
             rgb = niri_tonemap_bt2020(rgb, ref_scale, max_scale, niri_content_peak);
         }
-        rgb = niri_pq_oetf(max(rgb, vec3(0.0)));
+        // A raised reference-luminance or bad max_cll must not push the encode past 1.0.
+        rgb = niri_scale_to_peak(max(rgb, vec3(0.0)), max_scale);
+        rgb = niri_pq_oetf(rgb);
         return vec4(rgb * a, a);
     }
 
     // SDR → HDR container (paper-white encode / desktop inverse tonemap).
-    rgb = pow(max(rgb, vec3(0.0)), vec3(2.2));
+    // Uses sdr_brightness when set; does not affect PQ or scRGB paths above.
+    float sdr_scale = niri_sdr_lum_scale > 0.0 ? niri_sdr_lum_scale : ref_scale;
+    // SDR is defined in [0, 1]. Extended-range values here mean a mis-tagged buffer, and
+    // gamma-expanding them overflows the PQ encode, which clips per channel and breaks hue.
+    rgb = pow(clamp(rgb, 0.0, 1.0), vec3(2.2));
     rgb = to_bt2020 * rgb;
-    rgb = niri_pq_oetf(rgb * ref_scale);
+    rgb = niri_pq_oetf(niri_scale_to_peak(rgb * sdr_scale, max_scale));
     return vec4(rgb * a, a);
 }

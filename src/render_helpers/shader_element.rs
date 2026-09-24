@@ -174,6 +174,7 @@ impl ShaderProgram {
         additional_uniforms.push(UniformName::new("niri_hdr_pq", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_ref_lum_scale", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_max_nit_scale", UniformType::_1f));
+        additional_uniforms.push(UniformName::new("niri_sdr_lum_scale", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_content_hdr", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_content_peak", UniformType::_1f));
         additional_uniforms.push(UniformName::new("niri_linear", UniformType::_1f));

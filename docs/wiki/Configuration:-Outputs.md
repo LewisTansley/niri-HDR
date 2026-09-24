@@ -326,7 +326,13 @@ The optional `mode` property:
 
 Children (all luminances in cd/m² / nits):
 
-- `reference-luminance` — SDR white / paper white (KDE Max SDR luminance). Default 203 (BT.2408).
+- `reference-luminance` — paper white for PQ reference matching and client feedback (KDE Max SDR
+  luminance when used alone). Default 203 (BT.2408). Also used as the SDR encode target when
+  `sdr-brightness` is unset.
+- `sdr-brightness` — absolute luminance for **SDR windows and compositor SDR UI only**. Does not
+  scale PQ HDR or Windows-scRGB / ExtLinear content. When unset, SDR follows `reference-luminance`.
+  If this is much higher than `reference-luminance`, SDR regions may clip in SDR screenshots /
+  screencasts (those still decode against `reference-luminance`).
 - `max-nits` — display peak (KDE Peak HDR luminance). Overrides EDID for metadata, client feedback,
   and the tonemap shoulder. Falls back to EDID, then 500.
 - `max-average-luminance` — optional MaxFALL. Falls back to EDID, then `max-nits`.
@@ -340,7 +346,8 @@ output "eDP-1" {
 
 output "DP-1" {
     hdr mode="on" {
-        reference-luminance 300
+        reference-luminance 203
+        sdr-brightness 400
         max-nits 1000
         max-average-luminance 400
     }

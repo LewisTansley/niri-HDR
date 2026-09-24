@@ -409,10 +409,10 @@ struct Surface {
     /// The last color state we tried to stage and the driver rejected. Tracked so a rejected
     /// state isn't re-tested every frame (each test is an atomic TEST_ONLY commit).
     failed_color_state: Option<ConnectorColorState>,
-    /// The blend space of the last rendered frame: `Some((reference_luminance, max_nits))` =
+    /// The blend space of the last rendered frame: `Some((reference_luminance, max_nits, sdr_brightness))` =
     /// HDR, `None` = SDR. Blend changes alter shader output without damaging anything, so a
     /// change forces a full redraw.
-    last_blend: Option<Option<(f64, f64)>>,
+    last_blend: Option<Option<crate::render_helpers::blend::BlendLuminances>>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
@@ -2043,7 +2043,7 @@ impl Tty {
         // The connector state is only *staged* here; smithay applies it inside its own commit
         // as a single atomic modeset together with mode, CRTC and plane state (committing
         // connector color properties standalone hangs some drivers, notably nvidia).
-        let (blend_hdr, pq_content, reference_luminance, max_nits) = {
+        let (blend_hdr, pq_content, reference_luminance, max_nits, sdr_brightness) = {
             let config = self.config.borrow();
             let output_config = config.outputs.find(&surface.name);
             let hdr_config = output_config.and_then(|o| o.hdr.clone());
@@ -2057,6 +2057,11 @@ impl Tty {
                 .and_then(|h| h.reference_luminance)
                 .map(|v| v.0)
                 .unwrap_or(DEFAULT_REFERENCE_LUMINANCE);
+            let sdr_brightness = hdr_config
+                .as_ref()
+                .and_then(|h| h.sdr_brightness)
+                .map(|v| v.0)
+                .unwrap_or(reference_luminance);
             let config_max_nits = hdr_config.as_ref().and_then(|h| h.max_nits).map(|v| v.0);
             let config_max_avg = hdr_config
                 .as_ref()
@@ -2124,12 +2129,18 @@ impl Tty {
                 }
             }
 
-            (blend_hdr, hdr_desc.is_some_and(|d| d.is_pq()), reference_luminance, max_nits)
+            (
+                blend_hdr,
+                hdr_desc.is_some_and(|d| d.is_pq()),
+                reference_luminance,
+                max_nits,
+                sdr_brightness,
+            )
         };
 
         // A blend-space change alters what every shader outputs without any element damage;
         // force a full redraw.
-        let blend = blend_hdr.then_some((reference_luminance, max_nits));
+        let blend = blend_hdr.then_some((reference_luminance, max_nits, sdr_brightness));
         if surface.last_blend != Some(blend) {
             surface.last_blend = Some(blend);
             surface.compositor.reset_buffers();
