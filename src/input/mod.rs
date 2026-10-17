@@ -528,6 +528,13 @@ impl State {
                         this.niri.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
                     }
+
+                    if this.niri.sidebar_shortcuts_ui.picker_is_open() {
+                        this.niri.sidebar_shortcuts_ui.close_picker();
+                        this.niri.queue_redraw_all();
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
                 }
 
                 if let Some(Keysym::space) = raw {
@@ -2285,6 +2292,126 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::MoveWindowToScratchpad => {
+                self.niri.layout.move_window_to_scratchpad(None);
+                self.niri.queue_redraw_all();
+            }
+            Action::MoveWindowToScratchpadById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.move_window_to_scratchpad(Some(&window));
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleScratchpad => {
+                self.niri.layout.toggle_scratchpad();
+                self.niri.queue_redraw_all();
+            }
+            Action::CycleScratchpad => {
+                self.niri.layout.cycle_scratchpad(true);
+                self.niri.queue_redraw_all();
+            }
+            Action::CycleScratchpadBack => {
+                self.niri.layout.cycle_scratchpad(false);
+                self.niri.queue_redraw_all();
+            }
+            Action::MoveWindowToSidebarLeft => {
+                self.niri
+                    .layout
+                    .move_window_to_sidebar(niri_config::SidebarSide::Left, None);
+                self.niri.queue_redraw_all();
+            }
+            Action::MoveWindowToSidebarLeftById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.move_window_to_sidebar(
+                        niri_config::SidebarSide::Left,
+                        Some(&window),
+                    );
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowToSidebarRight => {
+                self.niri
+                    .layout
+                    .move_window_to_sidebar(niri_config::SidebarSide::Right, None);
+                self.niri.queue_redraw_all();
+            }
+            Action::MoveWindowToSidebarRightById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.move_window_to_sidebar(
+                        niri_config::SidebarSide::Right,
+                        Some(&window),
+                    );
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::MoveWindowOutOfSidebar => {
+                self.niri.layout.move_window_out_of_sidebar(None);
+                self.niri.queue_redraw_all();
+            }
+            Action::MoveWindowOutOfSidebarById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.layout.move_window_out_of_sidebar(Some(&window));
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleSidebarLeft => {
+                self.niri
+                    .layout
+                    .toggle_sidebar(niri_config::SidebarSide::Left);
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleSidebarRight => {
+                self.niri
+                    .layout
+                    .toggle_sidebar(niri_config::SidebarSide::Right);
+                self.niri.queue_redraw_all();
+            }
+            Action::FocusSidebarLeft => {
+                self.niri
+                    .layout
+                    .focus_sidebar(niri_config::SidebarSide::Left);
+                self.maybe_warp_cursor_to_focus();
+                self.niri.layer_shell_on_demand_focus = None;
+                self.niri.queue_redraw_all();
+            }
+            Action::FocusSidebarRight => {
+                self.niri
+                    .layout
+                    .focus_sidebar(niri_config::SidebarSide::Right);
+                self.maybe_warp_cursor_to_focus();
+                self.niri.layer_shell_on_demand_focus = None;
+                self.niri.queue_redraw_all();
+            }
+            Action::SetSidebarWidth(change) => {
+                self.niri.layout.set_sidebar_width(change);
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleSidebarShortcutsLeft => {
+                self.niri
+                    .sidebar_shortcuts_ui
+                    .toggle(niri_config::SidebarSide::Left);
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleSidebarShortcutsRight => {
+                self.niri
+                    .sidebar_shortcuts_ui
+                    .toggle(niri_config::SidebarSide::Right);
+                self.niri.queue_redraw_all();
+            }
+            Action::PinWindowToSidebarShortcutsLeft => {
+                self.pin_focused_to_sidebar_shortcuts(niri_config::SidebarSide::Left);
+            }
+            Action::PinWindowToSidebarShortcutsRight => {
+                self.pin_focused_to_sidebar_shortcuts(niri_config::SidebarSide::Right);
+            }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
                     .niri
@@ -2636,6 +2763,17 @@ impl State {
             self.niri.pointer_inside_hot_corner = true;
         }
 
+        // Sidebar shortcuts dock edge hover (skip during grabs).
+        let has_grab = pointer.with_grab(|_, _| true).unwrap_or(false);
+        if !has_grab {
+            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+                let output = output.clone();
+                if self.update_sidebar_shortcuts_hover(&output, pos_within_output) {
+                    self.niri.queue_redraw(&output);
+                }
+            }
+        }
+
         // Activate a new confinement if necessary.
         self.niri.maybe_activate_pointer_constraint();
 
@@ -2727,6 +2865,16 @@ impl State {
             self.niri.pointer_inside_hot_corner = true;
         }
 
+        let has_grab = pointer.with_grab(|_, _| true).unwrap_or(false);
+        if !has_grab {
+            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                let output = output.clone();
+                if self.update_sidebar_shortcuts_hover(&output, pos_within_output) {
+                    self.niri.queue_redraw(&output);
+                }
+            }
+        }
+
         self.niri.maybe_activate_pointer_constraint();
 
         // We moved the pointer, show it.
@@ -2778,6 +2926,23 @@ impl State {
         let mod_down = modifiers.contains(mod_key.to_modifiers());
 
         if ButtonState::Pressed == button_state {
+            // Sidebar shortcuts dock clicks.
+            if matches!(button, Some(MouseButton::Left) | Some(MouseButton::Right)) {
+                let location = pointer.current_location();
+                if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                    let output = output.clone();
+                    if self.handle_sidebar_shortcuts_click(
+                        &output,
+                        pos_within_output,
+                        matches!(button, Some(MouseButton::Right)),
+                    ) {
+                        self.niri.suppressed_buttons.insert(button_code);
+                        self.niri.queue_redraw(&output);
+                        return;
+                    }
+                }
+            }
+
             let mut is_mru_open = false;
             if let Some(mru_output) = self.niri.window_mru_ui.output() {
                 is_mru_open = true;
@@ -3097,6 +3262,49 @@ impl State {
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
 
+        // Scroll the sidebar shortcuts app picker when the pointer is over it.
+        if self.niri.sidebar_shortcuts_ui.picker_is_open() {
+            let location = pointer.current_location();
+            if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                let output = output.clone();
+                let working_area = self
+                    .niri
+                    .layout
+                    .monitor_for_output(&output)
+                    .map(|mon| mon.working_area());
+                if let (Some(side), Some(working_area)) = (
+                    self.niri.sidebar_shortcuts_ui.picker_side(),
+                    working_area,
+                ) {
+                    let sharing = self
+                        .niri
+                        .config
+                        .borrow()
+                        .layout
+                        .sidebar
+                        .shortcuts_sharing;
+                    let count = self.niri.sidebar_shortcuts.visible(side, sharing).len();
+                    if self
+                        .niri
+                        .sidebar_shortcuts_ui
+                        .picker_rect(working_area, count)
+                        .is_some_and(|r| r.contains(pos_within_output))
+                    {
+                        let mut delta = 0.;
+                        if let Some(v) = event.amount(Axis::Vertical) {
+                            delta += v;
+                        } else if let Some(v) = vertical_amount_v120 {
+                            delta += v / 120. * 24.;
+                        }
+                        if self.niri.sidebar_shortcuts_ui.scroll_picker(delta) {
+                            self.niri.queue_redraw(&output);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         let is_overview_open = self.niri.layout.is_overview_open();
 
         // We should only handle scrolling in the overview if the pointer is not over a (top or
@@ -3306,8 +3514,14 @@ impl State {
             let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
 
-            let horizontal = horizontal_amount.unwrap_or(0.);
-            let vertical = vertical_amount.unwrap_or(0.);
+            let mut horizontal = horizontal_amount.unwrap_or(0.);
+            let mut vertical = vertical_amount.unwrap_or(0.);
+            if let Some(output) = self.niri.output_under_cursor() {
+                (horizontal, vertical) = self
+                    .niri
+                    .layout
+                    .map_gesture_delta(&output, horizontal, vertical);
+            }
 
             if should_handle_in_overview && modifiers.is_empty() {
                 let mut redraw = false;
@@ -3914,7 +4128,8 @@ impl State {
                 self.niri.gesture_swipe_3f_cumulative = None;
 
                 if let Some(output) = self.niri.output_under_cursor() {
-                    if cx.abs() > cy.abs() {
+                    let (main, cross) = self.niri.layout.map_gesture_delta(&output, cx, cy);
+                    if main.abs() > cross.abs() {
                         let output_ws = if is_overview_open {
                             self.niri.workspace_under_cursor(true)
                         } else {
@@ -3942,6 +4157,14 @@ impl State {
         }
 
         let timestamp = Duration::from_micros(event.time());
+
+        let (delta_x, delta_y) = if let Some(output) = self.niri.output_under_cursor() {
+            self.niri
+                .layout
+                .map_gesture_delta(&output, delta_x, delta_y)
+        } else {
+            (delta_x, delta_y)
+        };
 
         let mut handled = false;
         let res = self
@@ -4399,6 +4622,316 @@ impl State {
         let grab = grab.as_any();
 
         grab.is::<PickWindowGrab>() || grab.is::<PickColorGrab>() || Self::is_dnd_grab(grab)
+    }
+
+    fn update_sidebar_shortcuts_hover(
+        &mut self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        use niri_config::SidebarSide;
+
+        let Some(working_area) = self
+            .niri
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.working_area())
+        else {
+            return false;
+        };
+        let trigger = self
+            .niri
+            .config
+            .borrow()
+            .gestures
+            .sidebar_edge_drop
+            .trigger_width;
+        let delay_ms = self
+            .niri
+            .config
+            .borrow()
+            .gestures
+            .sidebar_edge_drop
+            .delay_ms;
+        let delay = Duration::from_millis(delay_ms.into());
+
+        let sharing = self
+            .niri
+            .config
+            .borrow()
+            .layout
+            .sidebar
+            .shortcuts_sharing;
+        let mut changed = false;
+        for side in [SidebarSide::Left, SidebarSide::Right] {
+            let fully_visible = self.niri.layout.sidebar_fully_visible(output, side);
+            let count = self.niri.sidebar_shortcuts.visible(side, sharing).len();
+            let in_edge = match side {
+                SidebarSide::Left => {
+                    pos.x >= working_area.loc.x
+                        && pos.x <= working_area.loc.x + trigger
+                        && pos.y >= working_area.loc.y
+                        && pos.y <= working_area.loc.y + working_area.size.h
+                }
+                SidebarSide::Right => {
+                    pos.x >= working_area.loc.x + working_area.size.w - trigger
+                        && pos.x <= working_area.loc.x + working_area.size.w
+                        && pos.y >= working_area.loc.y
+                        && pos.y <= working_area.loc.y + working_area.size.h
+                }
+            };
+            let in_strip = in_edge
+                || self.niri.sidebar_shortcuts_ui.contains_pointer(
+                    side,
+                    pos,
+                    working_area,
+                    count,
+                );
+            changed |= self.niri.sidebar_shortcuts_ui.pointer_edge(
+                side,
+                in_strip,
+                fully_visible,
+                delay,
+            );
+        }
+        changed
+    }
+
+    fn handle_sidebar_shortcuts_click(
+        &mut self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+        secondary: bool,
+    ) -> bool {
+        use niri_config::{SidebarSide, SidebarShortcut};
+
+        use crate::ui::sidebar_shortcuts::DockHit;
+
+        let Some(working_area) = self
+            .niri
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.working_area())
+        else {
+            return false;
+        };
+
+        let sharing = self
+            .niri
+            .config
+            .borrow()
+            .layout
+            .sidebar
+            .shortcuts_sharing;
+
+        // Click outside dock+picker while picker open → dismiss picker.
+        if self.niri.sidebar_shortcuts_ui.picker_is_open() {
+            let side = self.niri.sidebar_shortcuts_ui.picker_side();
+            let mut inside = false;
+            if let Some(side) = side {
+                let count = self.niri.sidebar_shortcuts.visible(side, sharing).len();
+                inside = self.niri.sidebar_shortcuts_ui.contains_pointer(
+                    side,
+                    pos,
+                    working_area,
+                    count,
+                );
+            }
+            if !inside {
+                self.niri.sidebar_shortcuts_ui.close_picker();
+                return true;
+            }
+        }
+
+        for side in [SidebarSide::Left, SidebarSide::Right] {
+            let count = self.niri.sidebar_shortcuts.visible(side, sharing).len();
+            let Some(hit) = self
+                .niri
+                .sidebar_shortcuts_ui
+                .hit(side, pos, working_area, count)
+            else {
+                continue;
+            };
+            match hit {
+                DockHit::Shortcut(idx) => {
+                    if secondary {
+                        self.niri
+                            .sidebar_shortcuts
+                            .remove_visible(side, sharing, idx);
+                    } else {
+                        self.activate_sidebar_shortcut(side, idx);
+                    }
+                }
+                DockHit::Add => {
+                    if !secondary {
+                        self.open_sidebar_shortcut_picker(side);
+                    }
+                }
+                DockHit::PickerApp(idx) => {
+                    if !secondary {
+                        if let Some(entry) =
+                            self.niri.sidebar_shortcuts_ui.take_picker_entry(idx)
+                        {
+                            let shortcut = SidebarShortcut {
+                                app_id: entry.app_id,
+                                title: entry.name,
+                                spawn: entry.exec,
+                            };
+                            self.niri.sidebar_shortcuts.add(side, shortcut);
+                            self.niri.sidebar_shortcuts_ui.set_open(side, true);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn open_sidebar_shortcut_picker(&mut self, side: niri_config::SidebarSide) {
+        let sharing = self
+            .niri
+            .config
+            .borrow()
+            .layout
+            .sidebar
+            .shortcuts_sharing;
+        let pinned: Vec<String> = self
+            .niri
+            .sidebar_shortcuts
+            .visible(side, sharing)
+            .iter()
+            .map(|s| s.app_id.clone())
+            .collect();
+        self.niri
+            .sidebar_shortcuts_ui
+            .open_picker(side, &pinned);
+        self.niri.queue_redraw_all();
+    }
+
+    pub fn pin_focused_to_sidebar_shortcuts(&mut self, side: niri_config::SidebarSide) {
+        use niri_config::SidebarShortcut;
+
+        use crate::utils::desktop::find_desktop_entry;
+        use crate::utils::with_toplevel_role;
+
+        let Some(mapped) = self.niri.layout.focus() else {
+            return;
+        };
+        let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
+        let Some(app_id) = app_id else {
+            return;
+        };
+        let title = with_toplevel_role(mapped.toplevel(), |role| role.title.clone());
+        let entry = find_desktop_entry(&app_id);
+        let spawn = entry
+            .as_ref()
+            .map(|e| e.exec.clone())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_default();
+        let title = title.or_else(|| entry.and_then(|e| e.name));
+        let shortcut = SidebarShortcut {
+            app_id,
+            title,
+            spawn,
+        };
+        self.niri.sidebar_shortcuts.add(side, shortcut);
+        self.niri.sidebar_shortcuts_ui.set_open(side, true);
+        self.niri.queue_redraw_all();
+    }
+
+    pub fn activate_sidebar_shortcut(&mut self, side: niri_config::SidebarSide, idx: usize) {
+        use crate::niri::PendingSidebarOpen;
+        use crate::utils::desktop::find_desktop_entry;
+        use crate::utils::with_toplevel_role;
+
+        let sharing = self
+            .niri
+            .config
+            .borrow()
+            .layout
+            .sidebar
+            .shortcuts_sharing;
+        let Some(shortcut) = self
+            .niri
+            .sidebar_shortcuts
+            .visible(side, sharing)
+            .get(idx)
+            .cloned()
+        else {
+            return;
+        };
+
+        let matching = self.niri.layout.windows().find_map(|(_, mapped)| {
+            let id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
+            if id.as_deref() == Some(shortcut.app_id.as_str()) {
+                Some(mapped.window.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(window) = matching {
+            self.niri
+                .layout
+                .move_window_to_sidebar(side, Some(&window));
+            self.niri.layout.focus_sidebar(side);
+            self.niri.sidebar_shortcuts_ui.handoff_close(side);
+            self.niri.queue_redraw_all();
+            return;
+        }
+
+        let mut command = shortcut.spawn.clone();
+        if command.is_empty() {
+            if let Some(entry) = find_desktop_entry(&shortcut.app_id) {
+                command = entry.exec;
+            }
+        }
+        if command.is_empty() {
+            return;
+        }
+
+        let (token, _) = self.niri.activation_state.create_external_token(None);
+        spawn(command, Some(token.clone()));
+        self.niri.pending_sidebar_opens.push(PendingSidebarOpen {
+            app_id: shortcut.app_id,
+            side,
+            created: std::time::Instant::now(),
+        });
+        self.niri.sidebar_shortcuts_ui.handoff_close(side);
+        self.niri.queue_redraw_all();
+    }
+
+    /// If a newly mapped window matches a pending sidebar shortcut spawn, dock it.
+    pub fn try_fulfill_pending_sidebar_open(&mut self, window: &smithay::desktop::Window) {
+        use crate::utils::with_toplevel_role;
+
+        self.niri
+            .pending_sidebar_opens
+            .retain(|p| p.created.elapsed() < Duration::from_secs(30));
+
+        let app_id = with_toplevel_role(
+            window.toplevel().expect("no x11 support"),
+            |role| role.app_id.clone(),
+        );
+        let Some(app_id) = app_id else {
+            return;
+        };
+
+        let Some(idx) = self
+            .niri
+            .pending_sidebar_opens
+            .iter()
+            .position(|p| p.app_id == app_id)
+        else {
+            return;
+        };
+        let pending = self.niri.pending_sidebar_opens.remove(idx);
+        self.niri
+            .layout
+            .move_window_to_sidebar(pending.side, Some(window));
+        self.niri.layout.focus_sidebar(pending.side);
+        self.niri.queue_redraw_all();
     }
 }
 

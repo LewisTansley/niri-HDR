@@ -1,3 +1,4 @@
+use crate::sidebar::{SidebarEdgeDrop, SidebarEdgeDropPart};
 use crate::utils::MergeWith;
 use crate::FloatOrInt;
 
@@ -5,6 +6,7 @@ use crate::FloatOrInt;
 pub struct Gestures {
     pub dnd_edge_view_scroll: DndEdgeViewScroll,
     pub dnd_edge_workspace_switch: DndEdgeWorkspaceSwitch,
+    pub sidebar_edge_drop: SidebarEdgeDrop,
     pub hot_corners: HotCorners,
 }
 
@@ -15,6 +17,8 @@ pub struct GesturesPart {
     #[knuffel(child)]
     pub dnd_edge_workspace_switch: Option<DndEdgeWorkspaceSwitchPart>,
     #[knuffel(child)]
+    pub sidebar_edge_drop: Option<SidebarEdgeDropPart>,
+    #[knuffel(child)]
     pub hot_corners: Option<HotCorners>,
 }
 
@@ -24,6 +28,7 @@ impl MergeWith<GesturesPart> for Gestures {
             (self, part),
             dnd_edge_view_scroll,
             dnd_edge_workspace_switch,
+            sidebar_edge_drop,
         );
         merge_clone!((self, part), hot_corners);
     }

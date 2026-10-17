@@ -3,8 +3,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
+use niri_config::sidebar::sidebar_effective_default_column_width;
 use niri_config::{
-    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, Workspace as WorkspaceConfig,
+    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, SidebarSide,
+    Workspace as WorkspaceConfig,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
@@ -17,12 +19,14 @@ use smithay::utils::{Logical, Point, Rectangle, Serial, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 
+use super::axis::AxisMap;
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
 use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
-use super::tile::{Tile, TileRenderSnapshot};
+use super::sidebar::{Sidebar, SidebarRenderElement};
+use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac,
@@ -111,6 +115,15 @@ pub struct Workspace<W: LayoutElement> {
 
     /// Unique ID of this workspace.
     id: WorkspaceId,
+
+    /// Per-workspace left sidebar (when `layout.sidebar.scope = "workspace"`).
+    pub(super) left_sidebar: Option<Sidebar<W>>,
+
+    /// Per-workspace right sidebar (when `layout.sidebar.scope = "workspace"`).
+    pub(super) right_sidebar: Option<Sidebar<W>>,
+
+    /// Extra left/right insets from reserve-mode sidebars (logical px).
+    sidebar_insets: (f64, f64),
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +159,8 @@ niri_render_elements! {
     WorkspaceRenderElement<R> => {
         Scrolling = ScrollingSpaceRenderElement<R>,
         Floating = FloatingSpaceRenderElement<R>,
+        Tile = TileRenderElement<R>,
+        Sidebar = SidebarRenderElement<R>,
     }
 }
 
@@ -271,6 +286,9 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             id: WorkspaceId::next(),
+            left_sidebar: None,
+            right_sidebar: None,
+            sidebar_insets: (0., 0.),
         }
     }
 
@@ -335,6 +353,9 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             id: WorkspaceId::next(),
+            left_sidebar: None,
+            right_sidebar: None,
+            sidebar_insets: (0., 0.),
         }
     }
 
@@ -344,6 +365,23 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn id(&self) -> WorkspaceId {
         self.id
+    }
+
+    pub fn main_axis(&self) -> niri_config::MainAxis {
+        self.options.layout.main_axis
+    }
+
+    pub(super) fn axis(&self) -> AxisMap {
+        AxisMap::new(self.main_axis())
+    }
+
+    /// Physical size of a tiled window using this workspace's axis and column width.
+    pub fn tiled_size_for_width(
+        &self,
+        width: ColumnWidth,
+        is_full_width: bool,
+    ) -> Size<f64, Logical> {
+        self.scrolling.tile_size_for_width(width, is_full_width)
     }
 
     pub fn name(&self) -> Option<&String> {
@@ -365,10 +403,45 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.advance_animations();
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.advance_animations();
+        }
+        if self.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.left_sidebar = None;
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.right_sidebar = None;
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
+        self.scrolling.are_animations_ongoing()
+            || self.floating.are_animations_ongoing()
+            || self
+                .left_sidebar
+                .as_ref()
+                .is_some_and(|s| s.are_animations_ongoing())
+            || self
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.are_animations_ongoing())
+    }
+
+    pub(super) fn sidebar_needs_inset_sync(&self) -> bool {
+        self.left_sidebar
+            .as_ref()
+            .is_some_and(|s| s.needs_inset_sync())
+            || self
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.needs_inset_sync())
+    }
+
+    pub fn active_pending_sizing_mode(&self) -> super::SizingMode {
+        self.scrolling.active_pending_sizing_mode()
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -376,12 +449,24 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn update_render_elements(&mut self, is_active: bool) {
+        let sidebar_focused = self.left_sidebar.as_ref().is_some_and(|s| s.is_focused())
+            || self.right_sidebar.as_ref().is_some_and(|s| s.is_focused());
+
         self.scrolling
-            .update_render_elements(is_active && !self.floating_is_active.get());
+            .update_render_elements(is_active && !self.floating_is_active.get() && !sidebar_focused);
 
         let view_rect = Rectangle::from_size(self.view_size);
-        self.floating
-            .update_render_elements(is_active && self.floating_is_active.get(), view_rect);
+        self.floating.update_render_elements(
+            is_active && self.floating_is_active.get() && !sidebar_focused,
+            view_rect,
+        );
+
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.update_render_elements(is_active);
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.update_render_elements(is_active);
+        }
 
         self.shadow.update_render_elements(
             self.view_size,
@@ -400,16 +485,18 @@ impl<W: LayoutElement> Workspace<W> {
                 .adjusted_for_scale(scale),
         );
 
+        let area = self.area_with_sidebar_insets();
+
         self.scrolling.update_config(
             self.view_size,
-            self.working_area,
+            area,
             self.scale.fractional_scale(),
             options.clone(),
         );
 
         self.floating.update_config(
             self.view_size,
-            self.working_area,
+            area,
             self.scale.fractional_scale(),
             options.clone(),
         );
@@ -421,8 +508,128 @@ impl<W: LayoutElement> Workspace<W> {
         self.background_buffer
             .set_color(options.layout.background_color);
 
+        let left_mode = options
+            .layout
+            .sidebar
+            .left
+            .mode
+            .unwrap_or(options.layout.sidebar.mode);
+        let right_mode = options
+            .layout
+            .sidebar
+            .right
+            .mode
+            .unwrap_or(options.layout.sidebar.mode);
+
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.update_config(
+                self.view_size,
+                self.working_area,
+                scale,
+                options.clone(),
+                left_mode,
+            );
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.update_config(
+                self.view_size,
+                self.working_area,
+                scale,
+                options.clone(),
+                right_mode,
+            );
+        }
+
         self.base_options = base_options;
         self.options = options;
+    }
+
+    /// Working/parent area after applying reserve-mode sidebar insets.
+    pub fn area_with_sidebar_insets(&self) -> Rectangle<f64, Logical> {
+        let (left, right) = self.sidebar_insets;
+        let mut area = self.working_area;
+        area.loc.x += left;
+        area.size.w = f64::max(0., area.size.w - left - right);
+        area
+    }
+
+    pub fn set_sidebar_insets(&mut self, left: f64, right: f64) {
+        if self.sidebar_insets == (left, right) {
+            return;
+        }
+        let was_open = self.reserve_sidebar_open_for_column_defaults();
+        self.sidebar_insets = (left, right);
+        let is_open = self.reserve_sidebar_open_for_column_defaults();
+        if was_open != is_open {
+            self.scrolling
+                .apply_sidebar_open_state_default_width_swap(was_open, is_open);
+        }
+        let area = self.area_with_sidebar_insets();
+        let scale = self.scale.fractional_scale();
+        self.scrolling.update_config_for_sidebar_insets(
+            self.view_size,
+            area,
+            scale,
+            self.options.clone(),
+            is_open,
+        );
+        self.floating
+            .update_config(self.view_size, area, scale, self.options.clone());
+    }
+
+    fn reserve_sidebar_open_for_column_defaults(&self) -> bool {
+        self.sidebar_insets.0 + self.sidebar_insets.1 > 1e-6
+    }
+
+    pub fn sidebar_mut(&mut self, side: SidebarSide) -> &mut Option<Sidebar<W>> {
+        match side {
+            SidebarSide::Left => &mut self.left_sidebar,
+            SidebarSide::Right => &mut self.right_sidebar,
+        }
+    }
+
+    pub fn sidebar(&self, side: SidebarSide) -> Option<&Sidebar<W>> {
+        match side {
+            SidebarSide::Left => self.left_sidebar.as_ref(),
+            SidebarSide::Right => self.right_sidebar.as_ref(),
+        }
+    }
+
+    pub fn ensure_sidebar(&mut self, side: SidebarSide) -> &mut Sidebar<W> {
+        let mode = match side {
+            SidebarSide::Left => self
+                .options
+                .layout
+                .sidebar
+                .left
+                .mode
+                .unwrap_or(self.options.layout.sidebar.mode),
+            SidebarSide::Right => self
+                .options
+                .layout
+                .sidebar
+                .right
+                .mode
+                .unwrap_or(self.options.layout.sidebar.mode),
+        };
+        let view_size = self.view_size;
+        let working_area = self.working_area;
+        let scale = self.scale.fractional_scale();
+        let options = self.options.clone();
+        let clock = self.clock.clone();
+        let slot = self.sidebar_mut(side);
+        if slot.is_none() {
+            *slot = Some(Sidebar::new(
+                side,
+                mode,
+                view_size,
+                working_area,
+                scale,
+                clock,
+                options,
+            ));
+        }
+        slot.as_mut().unwrap()
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) {
@@ -451,13 +658,29 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn tiles(&self) -> impl Iterator<Item = &Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles();
         let floating = self.floating.tiles();
-        scrolling.chain(floating)
+        let left = self
+            .left_sidebar
+            .iter()
+            .flat_map(|s| s.tiles());
+        let right = self
+            .right_sidebar
+            .iter()
+            .flat_map(|s| s.tiles());
+        scrolling.chain(floating).chain(left).chain(right)
     }
 
     pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles_mut();
         let floating = self.floating.tiles_mut();
-        scrolling.chain(floating)
+        let left = self
+            .left_sidebar
+            .iter_mut()
+            .flat_map(|s| s.tiles_mut());
+        let right = self
+            .right_sidebar
+            .iter_mut()
+            .flat_map(|s| s.tiles_mut());
+        scrolling.chain(floating).chain(left).chain(right)
     }
 
     pub fn is_floating(&self, id: &W::Id) -> bool {
@@ -469,6 +692,16 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn active_window(&self) -> Option<&W> {
+        if let Some(sb) = &self.left_sidebar {
+            if sb.is_focused() {
+                return sb.active_window();
+            }
+        }
+        if let Some(sb) = &self.right_sidebar {
+            if sb.is_focused() {
+                return sb.active_window();
+            }
+        }
         if self.floating_is_active.get() {
             self.floating.active_window()
         } else {
@@ -477,6 +710,36 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn active_window_mut(&mut self) -> Option<&mut W> {
+        if self.left_sidebar.as_ref().is_some_and(|s| s.is_focused()) {
+            let idx = self.left_sidebar.as_ref().unwrap().active_window().map(|w| {
+                // Re-borrow mutably via tiles
+                w.id().clone()
+            });
+            if let Some(id) = idx {
+                return self
+                    .left_sidebar
+                    .as_mut()
+                    .unwrap()
+                    .windows_mut()
+                    .find(|w| w.id() == &id);
+            }
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.is_focused()) {
+            let id = self
+                .right_sidebar
+                .as_ref()
+                .unwrap()
+                .active_window()
+                .map(|w| w.id().clone());
+            if let Some(id) = id {
+                return self
+                    .right_sidebar
+                    .as_mut()
+                    .unwrap()
+                    .windows_mut()
+                    .find(|w| w.id() == &id);
+            }
+        }
         if self.floating_is_active.get() {
             self.floating.active_window_mut()
         } else {
@@ -557,15 +820,16 @@ impl<W: LayoutElement> Workspace<W> {
             self.update_config(self.base_options.clone());
         } else {
             // Pass our existing options as is.
+            let area = self.area_with_sidebar_insets();
             self.scrolling.update_config(
                 size,
-                working_area,
+                area,
                 scale.fractional_scale(),
                 self.options.clone(),
             );
             self.floating.update_config(
                 size,
-                working_area,
+                area,
                 scale.fractional_scale(),
                 self.options.clone(),
             );
@@ -738,12 +1002,24 @@ impl<W: LayoutElement> Workspace<W> {
         let removed = if self.floating.has_window(id) {
             from_floating = true;
             self.floating.remove_tile(id)
+        } else if self.left_sidebar.as_ref().is_some_and(|s| s.contains(id)) {
+            self.left_sidebar.as_mut().unwrap().remove(id).unwrap()
+        } else if self.right_sidebar.as_ref().is_some_and(|s| s.contains(id)) {
+            self.right_sidebar.as_mut().unwrap().remove(id).unwrap()
         } else {
             self.scrolling.remove_tile(id, transaction)
         };
 
         if let Some(output) = &self.output {
             removed.tile.window().output_leave(output);
+        }
+
+        // Drop empty workspace-scoped sidebars.
+        if self.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.left_sidebar = None;
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.right_sidebar = None;
         }
 
         self.update_focus_floating_tiling_after_removing(from_floating);
@@ -796,7 +1072,11 @@ impl<W: LayoutElement> Workspace<W> {
             Some(Some(width)) => Some(width),
             Some(None) => None,
             None if is_floating => None,
-            None => self.options.layout.default_column_width,
+            None => sidebar_effective_default_column_width(
+                &self.options.layout.sidebar,
+                self.options.layout.default_column_width,
+                self.reserve_sidebar_open_for_column_defaults(),
+            ),
         }
     }
 
@@ -908,6 +1188,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn focus_left(&mut self) -> bool {
         if self.floating_is_active.get() {
             self.floating.focus_left()
+        } else if self.axis().is_vertical() {
+            self.scrolling.focus_up()
         } else {
             self.scrolling.focus_left()
         }
@@ -916,6 +1198,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn focus_right(&mut self) -> bool {
         if self.floating_is_active.get() {
             self.floating.focus_right()
+        } else if self.axis().is_vertical() {
+            self.scrolling.focus_down()
         } else {
             self.scrolling.focus_right()
         }
@@ -939,13 +1223,25 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn focus_column_right_or_first(&mut self) {
         if !self.focus_right() {
-            self.focus_column_first();
+            if self.floating_is_active.get() {
+                self.floating.focus_leftmost();
+            } else if self.axis().is_vertical() {
+                self.scrolling.focus_top();
+            } else {
+                self.scrolling.focus_column_first();
+            }
         }
     }
 
     pub fn focus_column_left_or_last(&mut self) {
         if !self.focus_left() {
-            self.focus_column_last();
+            if self.floating_is_active.get() {
+                self.floating.focus_rightmost();
+            } else if self.axis().is_vertical() {
+                self.scrolling.focus_bottom();
+            } else {
+                self.scrolling.focus_column_last();
+            }
         }
     }
 
@@ -966,6 +1262,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn focus_down(&mut self) -> bool {
         if self.floating_is_active.get() {
             self.floating.focus_down()
+        } else if self.axis().is_vertical() {
+            self.scrolling.focus_right()
         } else {
             self.scrolling.focus_down()
         }
@@ -974,6 +1272,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn focus_up(&mut self) -> bool {
         if self.floating_is_active.get() {
             self.floating.focus_up()
+        } else if self.axis().is_vertical() {
+            self.scrolling.focus_left()
         } else {
             self.scrolling.focus_up()
         }
@@ -982,38 +1282,40 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn focus_down_or_left(&mut self) {
         if self.floating_is_active.get() {
             self.floating.focus_down();
-        } else {
-            self.scrolling.focus_down_or_left();
+        } else if !self.focus_down() {
+            self.focus_left();
         }
     }
 
     pub fn focus_down_or_right(&mut self) {
         if self.floating_is_active.get() {
             self.floating.focus_down();
-        } else {
-            self.scrolling.focus_down_or_right();
+        } else if !self.focus_down() {
+            self.focus_right();
         }
     }
 
     pub fn focus_up_or_left(&mut self) {
         if self.floating_is_active.get() {
             self.floating.focus_up();
-        } else {
-            self.scrolling.focus_up_or_left();
+        } else if !self.focus_up() {
+            self.focus_left();
         }
     }
 
     pub fn focus_up_or_right(&mut self) {
         if self.floating_is_active.get() {
             self.floating.focus_up();
-        } else {
-            self.scrolling.focus_up_or_right();
+        } else if !self.focus_up() {
+            self.focus_right();
         }
     }
 
     pub fn focus_window_top(&mut self) {
         if self.floating_is_active.get() {
             self.floating.focus_topmost();
+        } else if self.axis().is_vertical() {
+            self.scrolling.focus_column_first();
         } else {
             self.scrolling.focus_top();
         }
@@ -1022,6 +1324,8 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn focus_window_bottom(&mut self) {
         if self.floating_is_active.get() {
             self.floating.focus_bottommost();
+        } else if self.axis().is_vertical() {
+            self.scrolling.focus_column_last();
         } else {
             self.scrolling.focus_bottom();
         }
@@ -1043,6 +1347,8 @@ impl<W: LayoutElement> Workspace<W> {
         if self.floating_is_active.get() {
             self.floating.move_left();
             true
+        } else if self.axis().is_vertical() {
+            self.scrolling.move_up()
         } else {
             self.scrolling.move_left()
         }
@@ -1052,6 +1358,8 @@ impl<W: LayoutElement> Workspace<W> {
         if self.floating_is_active.get() {
             self.floating.move_right();
             true
+        } else if self.axis().is_vertical() {
+            self.scrolling.move_down()
         } else {
             self.scrolling.move_right()
         }
@@ -1082,6 +1390,8 @@ impl<W: LayoutElement> Workspace<W> {
         if self.floating_is_active.get() {
             self.floating.move_down();
             true
+        } else if self.axis().is_vertical() {
+            self.scrolling.move_right()
         } else {
             self.scrolling.move_down()
         }
@@ -1091,6 +1401,8 @@ impl<W: LayoutElement> Workspace<W> {
         if self.floating_is_active.get() {
             self.floating.move_up();
             true
+        } else if self.axis().is_vertical() {
+            self.scrolling.move_left()
         } else {
             self.scrolling.move_up()
         }
@@ -1610,6 +1922,16 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn active_window_visual_rectangle(&self) -> Option<Rectangle<f64, Logical>> {
+        if let Some(sb) = &self.left_sidebar {
+            if sb.is_focused() {
+                return sb.active_window_visual_rectangle();
+            }
+        }
+        if let Some(sb) = &self.right_sidebar {
+            if sb.is_focused() {
+                return sb.active_window_visual_rectangle();
+            }
+        }
         if self.floating_is_active.get() {
             self.floating.active_window_visual_rectangle()
         } else {
@@ -1618,6 +1940,16 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn popup_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        if let Some(sb) = &self.left_sidebar {
+            if let Some(rect) = sb.popup_target_rect(window) {
+                return Some(rect);
+            }
+        }
+        if let Some(sb) = &self.right_sidebar {
+            if let Some(rect) = sb.popup_target_rect(window) {
+                return Some(rect);
+            }
+        }
         if self.floating.has_window(window) {
             self.floating.popup_target_rect(window)
         } else {
@@ -1658,6 +1990,20 @@ impl<W: LayoutElement> Workspace<W> {
             });
     }
 
+    pub fn render_sidebars<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        xray_pos: XrayPos,
+        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+    ) {
+        if let Some(sb) = &self.left_sidebar {
+            sb.render(ctx.r(), xray_pos, &mut |elem| push(elem.into()));
+        }
+        if let Some(sb) = &self.right_sidebar {
+            sb.render(ctx.r(), xray_pos, &mut |elem| push(elem.into()));
+        }
+    }
+
     pub fn render_shadow<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -1695,6 +2041,35 @@ impl<W: LayoutElement> Workspace<W> {
         xray_pos: XrayPos,
         window: &W::Id,
     ) {
+        if self
+            .left_sidebar
+            .as_ref()
+            .is_some_and(|s| s.contains(window))
+        {
+            self.left_sidebar.as_mut().unwrap().store_unmap_snapshot_if_empty(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+                window,
+            );
+            return;
+        }
+        if self
+            .right_sidebar
+            .as_ref()
+            .is_some_and(|s| s.contains(window))
+        {
+            self.right_sidebar.as_mut().unwrap().store_unmap_snapshot_if_empty(
+                renderer,
+                xray,
+                xray_has_blocked_out_layers,
+                xray_pos,
+                window,
+            );
+            return;
+        }
+
         let view_size = self.view_size();
         for (tile, tile_pos) in self.tiles_with_render_positions_mut(false) {
             if tile.window().id() == window {
@@ -1720,6 +2095,17 @@ impl<W: LayoutElement> Workspace<W> {
                 return;
             }
         }
+        if let Some(sb) = &mut self.left_sidebar {
+            if let Some(tile) = sb.tiles_mut().find(|t| t.window().id() == window) {
+                let _ = tile.take_unmap_snapshot();
+                return;
+            }
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            if let Some(tile) = sb.tiles_mut().find(|t| t.window().id() == window) {
+                let _ = tile.take_unmap_snapshot();
+            }
+        }
     }
 
     pub fn start_close_animation_for_window(
@@ -1728,6 +2114,26 @@ impl<W: LayoutElement> Workspace<W> {
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
+        if self
+            .left_sidebar
+            .as_ref()
+            .is_some_and(|s| s.contains(window))
+        {
+            self.left_sidebar.as_mut().unwrap().start_close_animation_for_window(
+                renderer, window, blocker,
+            );
+            return;
+        }
+        if self
+            .right_sidebar
+            .as_ref()
+            .is_some_and(|s| s.contains(window))
+        {
+            self.right_sidebar.as_mut().unwrap().start_close_animation_for_window(
+                renderer, window, blocker,
+            );
+            return;
+        }
         if self.floating.has_window(window) {
             self.floating
                 .start_close_animation_for_window(renderer, window, blocker);
@@ -1750,10 +2156,32 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
+        if let Some(sb) = &mut self.left_sidebar {
+            if sb.start_open_animation(id) {
+                return true;
+            }
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            if sb.start_open_animation(id) {
+                return true;
+            }
+        }
         self.scrolling.start_open_animation(id) || self.floating.start_open_animation(id)
     }
 
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
+        // Sidebars above floating/scrolling when visible.
+        if let Some(sb) = &self.left_sidebar {
+            if let Some(rv) = sb.window_under(pos) {
+                return Some(rv);
+            }
+        }
+        if let Some(sb) = &self.right_sidebar {
+            if let Some(rv) = sb.window_under(pos) {
+                return Some(rv);
+            }
+        }
+
         // This logic is consistent with tiles_with_render_positions().
         if self.is_floating_visible() {
             if let Some(rv) = self
@@ -1805,6 +2233,20 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn update_window(&mut self, window: &W::Id, serial: Option<Serial>) {
+        if self
+            .left_sidebar
+            .as_mut()
+            .is_some_and(|s| s.update_window(window, serial))
+        {
+            return;
+        }
+        if self
+            .right_sidebar
+            .as_mut()
+            .is_some_and(|s| s.update_window(window, serial))
+        {
+            return;
+        }
         if !self.floating.update_window(window, serial) {
             self.scrolling.update_window(window, serial);
         }
@@ -1830,10 +2272,28 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn activate_window(&mut self, window: &W::Id) -> bool {
-        if self.floating.activate_window(window) {
+        if self.left_sidebar.as_mut().is_some_and(|s| s.activate_window(window)) {
+            if let Some(sb) = &mut self.right_sidebar {
+                sb.set_focused(false);
+            }
+            self.floating_is_active = FloatingActive::No;
+            true
+        } else if self
+            .right_sidebar
+            .as_mut()
+            .is_some_and(|s| s.activate_window(window))
+        {
+            if let Some(sb) = &mut self.left_sidebar {
+                sb.set_focused(false);
+            }
+            self.floating_is_active = FloatingActive::No;
+            true
+        } else if self.floating.activate_window(window) {
+            self.clear_sidebar_focus();
             self.floating_is_active = FloatingActive::Yes;
             true
         } else if self.scrolling.activate_window(window) {
+            self.clear_sidebar_focus();
             self.floating_is_active = FloatingActive::No;
             true
         } else {
@@ -1841,11 +2301,42 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub fn clear_sidebar_focus(&mut self) {
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.set_focused(false);
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.set_focused(false);
+        }
+    }
+
     pub fn activate_window_without_raising(&mut self, window: &W::Id) -> bool {
-        if self.floating.activate_window_without_raising(window) {
+        if self
+            .left_sidebar
+            .as_mut()
+            .is_some_and(|s| s.activate_window(window))
+        {
+            if let Some(sb) = &mut self.right_sidebar {
+                sb.set_focused(false);
+            }
+            self.floating_is_active = FloatingActive::No;
+            true
+        } else if self
+            .right_sidebar
+            .as_mut()
+            .is_some_and(|s| s.activate_window(window))
+        {
+            if let Some(sb) = &mut self.left_sidebar {
+                sb.set_focused(false);
+            }
+            self.floating_is_active = FloatingActive::No;
+            true
+        } else if self.floating.activate_window_without_raising(window) {
+            self.clear_sidebar_focus();
             self.floating_is_active = FloatingActive::Yes;
             true
         } else if self.scrolling.activate_window(window) {
+            self.clear_sidebar_focus();
             self.floating_is_active = match self.floating_is_active {
                 FloatingActive::No => FloatingActive::No,
                 FloatingActive::NoButRaised => FloatingActive::NoButRaised,
@@ -2012,14 +2503,18 @@ impl<W: LayoutElement> Workspace<W> {
             options.layout.background_color.to_array_unpremul(),
         );
 
-        assert_eq!(self.view_size, self.scrolling.view_size());
-        assert_eq!(self.working_area, self.scrolling.parent_area());
+        let area = self.area_with_sidebar_insets();
+
+        // Scrolling space stores main/cross sizes. Horizontal is an identity mapping.
+        let axis = self.axis();
+        assert_eq!(axis.size_in(self.view_size), self.scrolling.view_size());
+        assert_eq!(axis.rect_in(area), self.scrolling.parent_area());
         assert_eq!(&self.clock, self.scrolling.clock());
         assert!(Rc::ptr_eq(&self.options, self.scrolling.options()));
         self.scrolling.verify_invariants();
 
         assert_eq!(self.view_size, self.floating.view_size());
-        assert_eq!(self.working_area, self.floating.working_area());
+        assert_eq!(area, self.floating.working_area());
         assert_eq!(&self.clock, self.floating.clock());
         assert!(Rc::ptr_eq(&self.options, self.floating.options()));
         self.floating.verify_invariants();

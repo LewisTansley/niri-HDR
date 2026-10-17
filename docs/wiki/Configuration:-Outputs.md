@@ -394,7 +394,9 @@ output "SomeCompany VerticalMonitor 1234" {
 
     // Layout config overrides just for this output.
     layout {
-        default-column-width { proportion 1.0; }
+        // Stack windows as rows on this portrait output.
+        main-axis "vertical"
+        default-column-width { proportion 0.5; }
 
         // ...any other setting.
     }
@@ -433,3 +435,5 @@ output "eDP-1" {
     }
 }
 ```
+
+Enum options like `center-visible-columns` can be overridden the same way, e.g. `center-visible-columns "never"`.

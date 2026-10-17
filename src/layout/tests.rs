@@ -1,10 +1,10 @@
 use std::cell::{Cell, OnceCell, RefCell};
 
-use niri_config::utils::{Flag, MergeWith as _};
+use niri_config::utils::Flag;
 use niri_config::workspace::WorkspaceName;
 use niri_config::{
-    CenterFocusedColumn, FloatOrInt, OutputName, Struts, TabIndicatorLength, TabIndicatorPosition,
-    WorkspaceReference,
+    CenterFocusedColumn, CenterVisibleColumns, FloatOrInt, OutputName, Struts,
+    TabIndicatorLength, TabIndicatorPosition, WorkspaceReference,
 };
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
@@ -172,12 +172,14 @@ impl LayoutElement for TestWindow {
         &mut self,
         size: Size<i32, Logical>,
         mode: SizingMode,
-        _animate: bool,
+        animate: bool,
         _transaction: Option<Transaction>,
     ) {
         if self.0.requested_size.get() != Some(size) {
             self.0.requested_size.set(Some(size));
-            self.0.animate_next_configure.set(true);
+            if animate {
+                self.0.animate_next_configure.set(true);
+            }
         }
 
         self.0.pending_sizing_mode.set(mode);
@@ -905,10 +907,15 @@ impl Op {
 
                 let is_floating = params.is_floating;
                 let win = TestWindow::new(params);
+                // Match the real compositor: resolve layout/sidebar default column width.
+                let width = layout
+                    .active_workspace()
+                    .map(|ws| ws.resolve_default_width(None, is_floating))
+                    .flatten();
                 layout.add_window(
                     win,
                     AddWindowTarget::Auto,
-                    None,
+                    width,
                     None,
                     false,
                     is_floating,
@@ -1121,8 +1128,12 @@ impl Op {
 
                 layout.focus_column_right_or_output(&output);
             }
-            Op::FocusWindowDown => layout.focus_down(),
-            Op::FocusWindowUp => layout.focus_up(),
+            Op::FocusWindowDown => {
+                layout.focus_down();
+            }
+            Op::FocusWindowUp => {
+                layout.focus_up();
+            }
             Op::FocusWindowDownOrColumnLeft => layout.focus_down_or_left(),
             Op::FocusWindowDownOrColumnRight => layout.focus_down_or_right(),
             Op::FocusWindowUpOrColumnLeft => layout.focus_up_or_left(),
@@ -3476,6 +3487,2087 @@ fn move_column_to_workspace_unfocused_with_multiple_monitors() {
 }
 
 #[test]
+fn scratchpad_toggle_and_cycle() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_scratchpad(Some(&1));
+    layout.verify_invariants();
+    assert!(layout.active_monitor_ref().unwrap().scratchpad.contains(&1));
+    assert!(!layout.active_monitor_ref().unwrap().scratchpad.contains(&2));
+
+    layout.toggle_scratchpad();
+    layout.verify_invariants();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().scratchpad.shown_id(),
+        Some(&1)
+    );
+
+    layout.move_window_to_scratchpad(Some(&2));
+    layout.verify_invariants();
+    layout.cycle_scratchpad(true);
+    layout.verify_invariants();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().scratchpad.shown_id(),
+        Some(&1)
+    );
+
+    layout.toggle_scratchpad();
+    layout.verify_invariants();
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .scratchpad
+        .shown_id()
+        .is_none());
+}
+
+#[test]
+fn sidebar_move_and_reserve_insets() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+    {
+        let mon = layout.active_monitor_ref().unwrap();
+        let sb = mon.left_sidebar.as_ref().unwrap();
+        assert!(sb.contains(&1));
+        assert!(sb.reserved_inset() > 0.);
+        let ws = mon.active_workspace_ref();
+        assert!(ws.area_with_sidebar_insets().size.w < ws.view_size().w);
+    }
+
+    // Regression: output-scoped sidebar windows must not panic FFM / popup lookup.
+    assert!(layout.should_trigger_focus_follows_mouse_on(&1));
+    let popup = layout.popup_target_rect(&1);
+    assert!(popup.size.w > 0. && popup.size.h > 0.);
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    layout.verify_invariants();
+    assert!(!layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .is_visible());
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    layout.focus_sidebar(niri_config::SidebarSide::Left);
+    layout.toggle_width(true);
+    layout.verify_invariants();
+
+    layout.move_window_out_of_sidebar(Some(&1));
+    layout.verify_invariants();
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .is_none());
+}
+
+#[test]
+fn sidebar_hides_when_maximized_or_fullscreen() {
+    let mut options = Options::default();
+    options.layout.sidebar.hide_when_maximized = true;
+    options.layout.sidebar.hide_when_fullscreen = true;
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let full_inset = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .reserved_inset();
+    assert!(full_inset > 0.);
+
+    layout.toggle_maximized(&2);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(!sb.is_visible());
+        assert_eq!(sb.reserved_inset(), 0.);
+    }
+
+    layout.toggle_maximized(&2);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(sb.is_visible());
+        assert!((sb.reserved_inset() - full_inset).abs() < 1e-6);
+    }
+
+    layout.toggle_fullscreen(&2);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(!sb.is_visible());
+        assert_eq!(sb.reserved_inset(), 0.);
+    }
+
+    layout.toggle_fullscreen(&2);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(sb.is_visible());
+        assert!((sb.reserved_inset() - full_inset).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn sidebar_does_not_auto_hide_without_flags() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let full_inset = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .reserved_inset();
+    assert!(full_inset > 0.);
+
+    layout.toggle_maximized(&2);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let sb = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap();
+    assert!(sb.is_visible());
+    assert!((sb.reserved_inset() - full_inset).abs() < 1e-6);
+}
+
+#[test]
+fn sidebar_open_close_animates_reserved_inset() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    // Window 1 stays tiled; window 2 goes into the sidebar.
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&2));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let full_inset = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .reserved_inset();
+    assert!(full_inset > 0.);
+    let tiling_size_before = layout
+        .windows()
+        .find(|(_, w)| *w.id() == 1)
+        .unwrap()
+        .1
+        .requested_size();
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    // Mid-close: still rendering and inset between 0 and full.
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(!sb.is_visible());
+        assert!(sb.is_rendered());
+        assert!(sb.are_animations_ongoing());
+        let inset = sb.reserved_inset();
+        assert!(inset > 0. && inset <= full_inset);
+    }
+
+    // Clear leftover animate flags from earlier ops, then sync mid-close.
+    layout
+        .windows()
+        .find(|(_, w)| *w.id() == 1)
+        .unwrap()
+        .1
+        .0
+        .animate_next_configure
+        .set(false);
+    let now = layout.clock.now_unadjusted() + Duration::from_millis(50);
+    layout.clock.set_unadjusted(now);
+    layout.advance_animations();
+    {
+        let tiling_win = layout
+            .windows()
+            .find(|(_, w)| *w.id() == 1)
+            .unwrap()
+            .1;
+        assert_ne!(tiling_size_before, tiling_win.requested_size());
+        assert!(
+            !tiling_win.0.animate_next_configure.get(),
+            "tiling window must not arm animate_next_configure during sidebar open/close inset sync"
+        );
+    }
+
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(!sb.is_visible());
+        assert!(!sb.is_rendered());
+        assert_eq!(sb.reserved_inset(), 0.);
+        assert!(!sb.are_animations_ongoing());
+    }
+    let ws = layout.active_monitor_ref().unwrap().active_workspace_ref();
+    assert_eq!(ws.area_with_sidebar_insets().size.w, ws.view_size().w);
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let sb = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap();
+    assert!(sb.is_visible());
+    assert!((sb.reserved_inset() - full_inset).abs() < 1e-6);
+}
+
+fn test_tiling_window_width(layout: &Layout<TestWindow>, id: usize) -> i32 {
+    layout
+        .windows()
+        .find(|(_, w)| *w.id() == id)
+        .unwrap()
+        .1
+        .requested_size()
+        .unwrap()
+        .w
+}
+
+#[test]
+fn sidebar_swaps_default_matching_column_on_open() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.sidebar.default_column_width_when_open =
+        Some(PresetSize::Proportion(0.35));
+
+    let mut layout = check_ops_with_options(
+        options.clone(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+        ],
+    );
+
+    let width_at_default_closed = test_tiling_window_width(&layout, 2);
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let gaps = options.layout.gaps;
+    let expected_open_default =
+        ((working_w - gaps) * 0.35 - gaps).round() as i32;
+    let width_after_open = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width_after_open - expected_open_default).abs() <= 2,
+        "expected default-matching column to swap to open default (got {width_after_open}, expected ~{expected_open_default})"
+    );
+    assert!(
+        width_after_open < width_at_default_closed,
+        "open default should be narrower than closed default on a smaller strip"
+    );
+}
+
+#[test]
+fn sidebar_column_width_pairs_swap_on_open_and_close() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.sidebar.column_width_pairs = vec![
+        niri_config::ColumnWidthPair {
+            closed: Some(PresetSize::Proportion(0.5)),
+            open: Some(PresetSize::Proportion(1.0)),
+        },
+        niri_config::ColumnWidthPair {
+            closed: Some(PresetSize::Proportion(1. / 3.)),
+            open: Some(PresetSize::Proportion(0.5)),
+        },
+    ];
+    // Should be ignored while pairs are set.
+    options.layout.sidebar.default_column_width_when_open =
+        Some(PresetSize::Proportion(0.35));
+
+    let mut layout = check_ops_with_options(
+        options.clone(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumn(2),
+            Op::SetColumnWidth(SizeChange::SetProportion(100. / 3.)),
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+        ],
+    );
+
+    // Window 2 is pair[1] closed (1/3); window 3 is pair[0] closed (0.5).
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let gaps = options.layout.gaps;
+    let expected_pair0_open = ((working_w - gaps) * 1.0 - gaps).round() as i32;
+    let expected_pair1_open = ((working_w - gaps) * 0.5 - gaps).round() as i32;
+
+    let width3 = test_tiling_window_width(&layout, 3);
+    let width2 = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width3 - expected_pair0_open).abs() <= 2,
+        "pair[0] column should swap to open side (got {width3}, expected ~{expected_pair0_open})"
+    );
+    assert!(
+        (width2 - expected_pair1_open).abs() <= 2,
+        "pair[1] column should swap to its own open side (got {width2}, expected ~{expected_pair1_open})"
+    );
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let expected_pair0_closed = ((working_w - gaps) * 0.5 - gaps).round() as i32;
+    let expected_pair1_closed = ((working_w - gaps) * (1. / 3.) - gaps).round() as i32;
+
+    let width3 = test_tiling_window_width(&layout, 3);
+    let width2 = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width3 - expected_pair0_closed).abs() <= 2,
+        "pair[0] column should swap back to closed side (got {width3}, expected ~{expected_pair0_closed})"
+    );
+    assert!(
+        (width2 - expected_pair1_closed).abs() <= 2,
+        "pair[1] column should swap back to closed side (got {width2}, expected ~{expected_pair1_closed})"
+    );
+}
+
+#[test]
+fn sidebar_column_width_pairs_mod_r_uses_open_side() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.preset_column_widths = vec![
+        PresetSize::Proportion(0.25),
+        PresetSize::Proportion(0.75),
+    ];
+    options.layout.sidebar.column_width_pairs = vec![
+        niri_config::ColumnWidthPair {
+            closed: Some(PresetSize::Proportion(0.5)),
+            open: Some(PresetSize::Proportion(1.0)),
+        },
+        niri_config::ColumnWidthPair {
+            closed: Some(PresetSize::Proportion(1. / 3.)),
+            open: Some(PresetSize::Proportion(0.5)),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(
+        options.clone(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let gaps = options.layout.gaps;
+    let open_half = ((working_w - gaps) * 0.5 - gaps).round() as i32;
+    let open_full = ((working_w - gaps) * 1.0 - gaps).round() as i32;
+
+    // After open, window 2 is on pair[0] open (1.0, largest). Forwards wraps to the
+    // smallest open side (pair[1] = 0.5), not the next list index.
+    layout.toggle_width(true);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let width = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width - open_half).abs() <= 2,
+        "Mod+R from largest open side should wrap to smallest (got {width}, expected ~{open_half})"
+    );
+
+    // Next forwards climbs ascending: 0.5 → 1.0.
+    layout.toggle_width(true);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let width = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width - open_full).abs() <= 2,
+        "Mod+R should climb ascending open sizes (got {width}, expected ~{open_full})"
+    );
+
+    // One more wrap to smallest again, then close to verify pair linkage.
+    layout.toggle_width(true);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let expected_closed = ((working_w - gaps) * (1. / 3.) - gaps).round() as i32;
+    let width = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width - expected_closed).abs() <= 2,
+        "after Mod+R then close, column should use pair closed side (got {width}, expected ~{expected_closed})"
+    );
+}
+
+#[test]
+fn sidebar_column_width_pairs_skip_full_width() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.sidebar.column_width_pairs = vec![niri_config::ColumnWidthPair {
+        closed: Some(PresetSize::Proportion(0.5)),
+        open: Some(PresetSize::Proportion(0.35)),
+    }];
+
+    let mut layout = check_ops_with_options(
+        options.clone(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumn(2),
+            Op::MaximizeColumn,
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let gaps = options.layout.gaps;
+    let expected_full = ((working_w - gaps) * 1.0 - gaps).round() as i32;
+    let width = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width - expected_full).abs() <= 2,
+        "full-width column should not be pair-swapped (got {width}, expected ~{expected_full})"
+    );
+}
+
+#[test]
+fn sidebar_clamps_max_column_proportion_when_closed() {
+    let mut options = Options::default();
+    options.layout.sidebar.max_column_proportion_when_closed = Some(0.5);
+
+    let mut layout = check_ops_with_options(
+        options.clone(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumn(2),
+            Op::SetColumnWidth(SizeChange::SetProportion(80.)),
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let gaps = options.layout.gaps;
+    let expected = ((working_w - gaps) * 0.5 - gaps).round() as i32;
+    let width = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width - expected).abs() <= 2,
+        "expected column clamped to max 0.5 when closed (got {width}, expected ~{expected})"
+    );
+}
+
+#[test]
+fn sidebar_clamps_min_column_proportion_when_open() {
+    let mut options = Options::default();
+    options.layout.sidebar.min_column_proportion_when_open = Some(0.5);
+
+    let mut layout = check_ops_with_options(
+        options.clone(),
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumn(2),
+            Op::SetColumnWidth(SizeChange::SetProportion(30.)),
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let ws = layout.active_workspace().unwrap();
+    let working_w = ws.scrolling().working_area().size.w;
+    let gaps = options.layout.gaps;
+    let expected = ((working_w - gaps) * 0.5 - gaps).round() as i32;
+    let width = test_tiling_window_width(&layout, 2);
+    assert!(
+        (width - expected).abs() <= 2,
+        "expected column clamped to min 0.5 when open (got {width}, expected ~{expected})"
+    );
+}
+
+#[test]
+fn sidebar_keep_proportions_preserves_non_default_column_pixels() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.sidebar.keep_proportions_on_sidebar_inset = true;
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::FocusColumn(2),
+            Op::SetColumnWidth(SizeChange::SetProportion(100. / 3.)),
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+        ],
+    );
+
+    let default_col_width = test_tiling_window_width(&layout, 1);
+    let third_col_width = test_tiling_window_width(&layout, 2);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&3));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let third_after = test_tiling_window_width(&layout, 2);
+    let default_after = test_tiling_window_width(&layout, 1);
+    assert!(
+        (third_after - third_col_width).abs() <= 2,
+        "non-default proportional column should keep its pixel width (was {third_col_width}, now {third_after})"
+    );
+    assert!(
+        default_after < default_col_width,
+        "default-matching column should still reflow smaller when the strip shrinks"
+    );
+}
+
+fn assert_active_column_within_working_area(scrolling: &scrolling::ScrollingSpace<TestWindow>) {
+    let area = scrolling.working_area();
+    let active = scrolling.active_column_idx();
+    let view_pos = scrolling.column_x_at(active) + scrolling.view_offset().current();
+    let screen_x = scrolling.column_x_at(active) - view_pos;
+    let col_w = scrolling.active_column_width();
+    assert!(
+        screen_x + 1e-3 >= area.loc.x,
+        "active column left edge {screen_x} is left of working area {}",
+        area.loc.x
+    );
+    assert!(
+        screen_x + col_w <= area.loc.x + area.size.w + 1e-3,
+        "active column right edge {} exceeds working area {}",
+        screen_x + col_w,
+        area.loc.x + area.size.w
+    );
+}
+
+fn assert_all_columns_within_working_area(scrolling: &scrolling::ScrollingSpace<TestWindow>) {
+    let area = scrolling.working_area();
+    let active = scrolling.active_column_idx();
+    let view_pos = scrolling.column_x_at(active) + scrolling.view_offset().current();
+    for idx in 0..scrolling.column_count() {
+        let screen_x = scrolling.column_x_at(idx) - view_pos;
+        let col_w = scrolling.column_width_at(idx);
+        assert!(
+            screen_x + 1e-3 >= area.loc.x,
+            "column {idx} left edge {screen_x} is left of working area {}",
+            area.loc.x
+        );
+        assert!(
+            screen_x + col_w <= area.loc.x + area.size.w + 1e-3,
+            "column {idx} right edge {} exceeds working area {}",
+            screen_x + col_w,
+            area.loc.x + area.size.w
+        );
+    }
+}
+
+fn assert_column_group_centered_in_working_area(scrolling: &scrolling::ScrollingSpace<TestWindow>) {
+    let n = scrolling.column_count();
+    assert!(n >= 1);
+    let area = scrolling.working_area();
+    let active = scrolling.active_column_idx();
+    let view_pos = scrolling.column_x_at(active) + scrolling.view_offset().current();
+    let left = scrolling.column_x_at(0) - view_pos;
+    let right = scrolling.column_x_at(n - 1) + scrolling.column_width_at(n - 1) - view_pos;
+    let left_margin = left - area.loc.x;
+    let right_margin = area.loc.x + area.size.w - right;
+    assert!(
+        (left_margin - right_margin).abs() < 1e-3,
+        "column group should be centered in working area (left margin {left_margin} vs right {right_margin})"
+    );
+    assert_all_columns_within_working_area(scrolling);
+}
+
+#[test]
+fn sidebar_inset_keeps_view_offset_in_sync() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let inset_open = {
+        let ws = layout.active_workspace().unwrap();
+        let scrolling = ws.scrolling();
+        let area = scrolling.working_area();
+        assert!(area.loc.x > 0.);
+        assert!(
+            !scrolling.view_offset().is_animation_ongoing(),
+            "settled open sidebar must not leave a lagging view animation"
+        );
+        assert_all_columns_within_working_area(scrolling);
+        assert_column_group_centered_in_working_area(scrolling);
+        area.loc.x
+    };
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    // Advance into the open/close spring so the inset has moved, then check that the
+    // tiling camera tracks without a lagging horizontal view animation and keeps the
+    // column group on screen / centered when it fits.
+    let mut saw_mid_close = false;
+    for _ in 0..60 {
+        let mut now = layout.clock.now_unadjusted();
+        now += Duration::from_millis(16);
+        layout.clock.set_unadjusted(now);
+        layout.advance_animations();
+
+        let mon = layout.active_monitor_ref().unwrap();
+        let sb = mon.left_sidebar.as_ref().unwrap();
+        let animating = sb.are_animations_ongoing();
+        let ws = mon.active_workspace_ref();
+        let scrolling = ws.scrolling();
+        let area = scrolling.working_area();
+        if area.loc.x <= 0. || (area.loc.x - inset_open).abs() < 1e-3 {
+            if !animating {
+                break;
+            }
+            continue;
+        }
+
+        assert!(area.loc.x > 0. && area.loc.x < inset_open);
+        assert!(
+            !scrolling.view_offset().is_animation_ongoing(),
+            "sidebar inset sync must not restart horizontal view movement"
+        );
+        assert_all_columns_within_working_area(scrolling);
+        saw_mid_close = true;
+        break;
+    }
+    assert!(
+        saw_mid_close,
+        "expected a mid-close inset sample while the sidebar open/close anim runs"
+    );
+
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert_eq!(sb.reserved_inset(), 0.);
+        let ws = layout.active_workspace().unwrap();
+        let scrolling = ws.scrolling();
+        assert_eq!(scrolling.working_area().loc.x, 0.);
+        assert!(!scrolling.view_offset().is_animation_ongoing());
+        assert_column_group_centered_in_working_area(scrolling);
+    }
+}
+
+#[test]
+fn sidebar_left_inset_keeps_right_aligned_column_on_screen() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.gaps = 0.;
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            // Scroll so the last column is brought into view (typically right-aligned by fit).
+            Op::FocusColumnLast,
+            Op::CompleteAnimations,
+        ],
+    );
+
+    // Put window 1 in the left sidebar; tiled focus stays on a later column.
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(
+        &mut layout,
+        [Op::FocusWindow(3), Op::CompleteAnimations],
+    );
+
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        assert_active_column_within_working_area(scrolling);
+        assert!(!scrolling.view_offset().is_animation_ongoing());
+    }
+
+    // Mid-close and settled: column that fits must remain inside the working area.
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    let mut saw_mid = false;
+    for _ in 0..60 {
+        let mut now = layout.clock.now_unadjusted();
+        now += Duration::from_millis(16);
+        layout.clock.set_unadjusted(now);
+        layout.advance_animations();
+
+        let mon = layout.active_monitor_ref().unwrap();
+        let Some(sb) = mon.left_sidebar.as_ref() else {
+            break;
+        };
+        let inset = sb.reserved_inset();
+        if inset <= 0. {
+            if !sb.are_animations_ongoing() {
+                break;
+            }
+            continue;
+        }
+        let scrolling = mon.active_workspace_ref().scrolling();
+        assert!(!scrolling.view_offset().is_animation_ongoing());
+        assert_active_column_within_working_area(scrolling);
+        saw_mid = true;
+        break;
+    }
+    assert!(saw_mid, "expected a mid-close inset sample");
+
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    assert_active_column_within_working_area(scrolling);
+}
+
+#[test]
+fn sidebar_right_inset_keeps_column_on_screen() {
+    let mut options = Options::default();
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.5));
+    options.layout.gaps = 0.;
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            Op::FocusColumnLast,
+            Op::CompleteAnimations,
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Right, Some(&1));
+    check_ops_on_layout(
+        &mut layout,
+        [Op::FocusWindow(3), Op::CompleteAnimations],
+    );
+
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        // Right inset has no delta_left; fit/center must still keep the column on screen.
+        assert!(scrolling.working_area().loc.x == 0.);
+        assert!(scrolling.working_area().size.w < 1280.);
+        assert_active_column_within_working_area(scrolling);
+        assert!(!scrolling.view_offset().is_animation_ongoing());
+    }
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Right);
+    for _ in 0..60 {
+        let mut now = layout.clock.now_unadjusted();
+        now += Duration::from_millis(16);
+        layout.clock.set_unadjusted(now);
+        layout.advance_animations();
+
+        let mon = layout.active_monitor_ref().unwrap();
+        let Some(sb) = mon.right_sidebar.as_ref() else {
+            break;
+        };
+        if sb.reserved_inset() <= 0. {
+            if !sb.are_animations_ongoing() {
+                break;
+            }
+            continue;
+        }
+        let scrolling = mon.active_workspace_ref().scrolling();
+        assert!(!scrolling.view_offset().is_animation_ongoing());
+        assert_active_column_within_working_area(scrolling);
+        break;
+    }
+
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    assert_active_column_within_working_area(scrolling);
+}
+
+#[test]
+fn sidebar_centers_column_group_that_fits() {
+    let mut options = Options::default();
+    // Two 0.3 columns fit easily in the strip with or without a sidebar.
+    options.layout.default_column_width = Some(PresetSize::Proportion(0.3));
+    options.layout.gaps = 0.;
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            Op::CompleteAnimations,
+        ],
+    );
+
+    // Move one window into the left sidebar; remaining two still fit and must be
+    // centered as a group in the reduced strip (not only the active column).
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        assert!(scrolling.working_area().loc.x > 0.);
+        assert_eq!(scrolling.column_count(), 2);
+        assert_column_group_centered_in_working_area(scrolling);
+        assert!(!scrolling.view_offset().is_animation_ongoing());
+    }
+
+    layout.toggle_sidebar(niri_config::SidebarSide::Left);
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    assert_eq!(scrolling.working_area().loc.x, 0.);
+    assert_eq!(scrolling.column_count(), 2);
+    assert_column_group_centered_in_working_area(scrolling);
+    assert!(!scrolling.view_offset().is_animation_ongoing());
+}
+
+#[test]
+fn center_visible_columns_always_centers_group_that_fits() {
+    let mut options = Options::default();
+    options.layout.gaps = 0.;
+    options.layout.center_visible_columns = CenterVisibleColumns::Always;
+
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::Communicate(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::Communicate(2),
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::Communicate(3),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    {
+        let scrolling = layout.active_workspace().unwrap().scrolling();
+        assert_eq!(scrolling.column_count(), 3);
+        assert_column_group_centered_in_working_area(scrolling);
+    }
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::FocusColumnLeft, Op::CompleteAnimations],
+    );
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    assert_column_group_centered_in_working_area(scrolling);
+}
+
+#[test]
+fn center_visible_columns_always_falls_through_when_strip_overflows() {
+    let mut options = Options::default();
+    // Three 600px columns on a 1280px output cannot all fit.
+    options.layout.gaps = 0.;
+    options.layout.center_visible_columns = CenterVisibleColumns::Always;
+
+    let layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(600)),
+            Op::Communicate(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(600)),
+            Op::Communicate(2),
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(600)),
+            Op::Communicate(3),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    assert_eq!(scrolling.column_count(), 3);
+    assert_active_column_within_working_area(scrolling);
+    // At least one column should be off-screen (strip does not fit).
+    let area = scrolling.working_area();
+    let active = scrolling.active_column_idx();
+    let view_pos = scrolling.column_x_at(active) + scrolling.view_offset().current();
+    let any_off = (0..scrolling.column_count()).any(|idx| {
+        let screen_x = scrolling.column_x_at(idx) - view_pos;
+        let col_w = scrolling.column_width_at(idx);
+        screen_x + 1e-3 < area.loc.x
+            || screen_x + col_w > area.loc.x + area.size.w + 1e-3
+    });
+    assert!(any_off, "expected the overflowing strip to leave some column off-screen");
+}
+
+#[test]
+fn center_visible_columns_always_yields_to_center_focused_column() {
+    let mut options = Options::default();
+    options.layout.gaps = 0.;
+    options.layout.center_visible_columns = CenterVisibleColumns::Always;
+    options.layout.center_focused_column = CenterFocusedColumn::Always;
+
+    let layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::Communicate(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(2),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::Communicate(2),
+            Op::AddWindow {
+                params: TestWindowParams::new(3),
+            },
+            Op::SetColumnWidth(SizeChange::SetFixed(300)),
+            Op::Communicate(3),
+            Op::CompleteAnimations,
+        ],
+    );
+
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    assert!(scrolling.is_centering_focused_column());
+    assert!(!scrolling.is_centering_visible_columns());
+    assert_active_column_within_working_area(scrolling);
+
+    // Active column alone is centered; the group as a whole is not.
+    let area = scrolling.working_area();
+    let active = scrolling.active_column_idx();
+    let view_pos = scrolling.column_x_at(active) + scrolling.view_offset().current();
+    let screen_x = scrolling.column_x_at(active) - view_pos;
+    let col_w = scrolling.column_width_at(active);
+    let left_margin = screen_x - area.loc.x;
+    let right_margin = area.loc.x + area.size.w - (screen_x + col_w);
+    assert!(
+        (left_margin - right_margin).abs() < 1e-3,
+        "active column should be centered when center-focused-column Always wins"
+    );
+
+    let n = scrolling.column_count();
+    let left = scrolling.column_x_at(0) - view_pos;
+    let right = scrolling.column_x_at(n - 1) + scrolling.column_width_at(n - 1) - view_pos;
+    let group_left = left - area.loc.x;
+    let group_right = area.loc.x + area.size.w - right;
+    assert!(
+        (group_left - group_right).abs() > 1.,
+        "group should not be centered when focused-column centering takes precedence"
+    );
+}
+
+#[test]
+fn sidebar_discrete_width_animates_then_settles() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    // Window 1 stays in the tiling strip; window 2 goes into the sidebar.
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&2));
+    layout.focus_sidebar(niri_config::SidebarSide::Left);
+    let before = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .width();
+    let tiling_size_before = layout
+        .windows()
+        .find(|(_, w)| *w.id() == 1)
+        .unwrap()
+        .1
+        .requested_size();
+
+    layout.set_sidebar_width(niri_ipc::SizeChange::SetProportion(40.));
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(
+            sb.are_animations_ongoing(),
+            "discrete width change must start width_anim"
+        );
+        assert_ne!(sb.width(), before);
+        // Sidebar tile was sized to the target width once with animate=true.
+        let sidebar_win = sb.windows().next().unwrap();
+        assert!(
+            sidebar_win.0.animate_next_configure.get(),
+            "sidebar tile must request animated size for discrete width"
+        );
+    }
+
+    // Clear leftover animate flags from earlier ops, then sync mid-width-anim.
+    layout
+        .windows()
+        .find(|(_, w)| *w.id() == 1)
+        .unwrap()
+        .1
+        .0
+        .animate_next_configure
+        .set(false);
+    let now = layout.clock.now_unadjusted() + Duration::from_millis(50);
+    layout.clock.set_unadjusted(now);
+    layout.advance_animations();
+    let tiling_win = layout
+        .windows()
+        .find(|(_, w)| *w.id() == 1)
+        .unwrap()
+        .1;
+    let tiling_size_mid = tiling_win.requested_size();
+    // Inset animation should drive a new size request on the tiling window.
+    assert_ne!(tiling_size_before, tiling_size_mid);
+    // Main-strip sizes lockstep without window-resize (avoids fighting the moving inset).
+    assert!(
+        !tiling_win.0.animate_next_configure.get(),
+        "tiling window must not arm animate_next_configure during sidebar width inset sync"
+    );
+
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(!sb.are_animations_ongoing() || sb.open_progress() == 1.);
+        assert!((sb.display_width() - sb.width()).abs() < 1e-6);
+        assert!((sb.reserved_inset() - sb.width()).abs() < 1e-6);
+    }
+
+    // Interactive edge resize applies immediately (no width anim).
+    let w0 = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .width();
+    let sidebar_req_before = layout
+        .windows()
+        .find(|(_, w)| *w.id() == 2)
+        .unwrap()
+        .1
+        .requested_size();
+    // Clear animate flag from the discrete path so we can observe the interactive request.
+    layout
+        .windows()
+        .find(|(_, w)| *w.id() == 2)
+        .unwrap()
+        .1
+        .0
+        .animate_next_configure
+        .set(false);
+    layout
+        .active_monitor()
+        .unwrap()
+        .left_sidebar
+        .as_mut()
+        .unwrap()
+        .resize_by_edges(ResizeEdge::RIGHT, Point::from((20., 0.)));
+    {
+        let sb = layout
+            .active_monitor_ref()
+            .unwrap()
+            .left_sidebar
+            .as_ref()
+            .unwrap();
+        assert!(
+            !sb.are_animations_ongoing() || sb.open_progress() == 1.,
+            "interactive resize must not leave a width_anim"
+        );
+        assert!((sb.display_width() - sb.width()).abs() < 1e-6);
+        assert!((sb.width() - (w0 + 20.)).abs() < 1e-6);
+    }
+    let sidebar_win = layout
+        .windows()
+        .find(|(_, w)| *w.id() == 2)
+        .unwrap()
+        .1;
+    assert_ne!(sidebar_req_before, sidebar_win.requested_size());
+    assert!(
+        !sidebar_win.0.animate_next_configure.get(),
+        "interactive edge resize must request size without animation"
+    );
+}
+
+#[test]
+fn sidebar_open_animation_and_close_window() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&2));
+    layout.start_open_animation_for_window(&1);
+    layout.verify_invariants();
+
+    // Closing one window reflows the stack; sidebar remains for the other.
+    check_ops_on_layout(&mut layout, [Op::CloseWindow(1)]);
+    layout.verify_invariants();
+    let sb = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap();
+    assert!(!sb.contains(&1));
+    assert!(sb.contains(&2));
+}
+
+#[test]
+fn sidebar_edge_drop_shows_insert_hint() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::InteractiveMoveBegin {
+            window: 1,
+            output_idx: 1,
+            px: 200.,
+            py: 100.,
+        },
+        // Exceed start threshold, then hold pointer in the left sidebar edge zone.
+        Op::InteractiveMoveUpdate {
+            window: 1,
+            dx: 300.,
+            dy: 0.,
+            output_idx: 1,
+            px: 10.,
+            py: 100.,
+        },
+    ]);
+
+    let output = layout.outputs().next().unwrap().clone();
+    layout.update_render_elements(Some(&output));
+
+    let mon = layout.active_monitor_ref().unwrap();
+    let hint = mon.insert_hint.as_ref().expect("sidebar insert hint");
+    assert!(matches!(
+        hint.position,
+        super::InsertPosition::Sidebar(niri_config::SidebarSide::Left)
+    ));
+    let loc = mon
+        .insert_hint_render_loc
+        .expect("sidebar insert hint overlay");
+    assert!(loc.size.w > 0. && loc.size.h > 0.);
+    assert!(loc.location.x < mon.view_size().w / 2.);
+    assert!(
+        loc.fixed_to_output,
+        "output-scoped sidebar insert hint must render in screen space"
+    );
+}
+
+#[test]
+fn sidebar_open_panel_drop_adds_window_mid_panel() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+
+    let panel = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .expect("open left sidebar")
+        .panel_rect();
+    let trigger = layout
+        .active_monitor_ref()
+        .unwrap()
+        .options
+        .gestures
+        .sidebar_edge_drop
+        .trigger_width;
+    // Mid-panel, clearly outside the thin edge strip.
+    let px = (panel.loc.x + panel.size.w * 0.5).max(trigger + 10.);
+    assert!(
+        px > trigger,
+        "test pointer must be outside edge strip (px={px}, trigger={trigger})"
+    );
+    let py = panel.loc.y + panel.size.h * 0.5;
+
+    let output = layout.outputs().next().unwrap().clone();
+    assert!(layout.interactive_move_begin(2, &output, Point::from((640., 100.))));
+    assert!(layout.interactive_move_update(
+        &2,
+        Point::from((400., 0.)),
+        output.clone(),
+        Point::from((px, py)),
+    ));
+    layout.update_render_elements(Some(&output));
+
+    let mon = layout.active_monitor_ref().unwrap();
+    let hint = mon.insert_hint.as_ref().expect("sidebar insert hint over open panel");
+    assert!(matches!(
+        hint.position,
+        super::InsertPosition::Sidebar(niri_config::SidebarSide::Left)
+    ));
+
+    layout.interactive_move_end(&2);
+    layout.verify_invariants();
+
+    let sb = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .expect("left sidebar after drop");
+    assert!(sb.contains(&1));
+    assert!(sb.contains(&2), "mid-panel drop must add window to open sidebar");
+}
+
+#[test]
+fn sidebar_absent_mid_panel_does_not_drop_without_edge() {
+    // With no open sidebar, only the edge strip docks — mid-panel must not synthesize a drop.
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::InteractiveMoveBegin {
+            window: 1,
+            output_idx: 1,
+            px: 640.,
+            py: 100.,
+        },
+        Op::InteractiveMoveUpdate {
+            window: 1,
+            dx: 400.,
+            dy: 0.,
+            output_idx: 1,
+            // Default preset panel is ~20% (~256px); mid of that is far outside trigger_width.
+            px: 120.,
+            py: 100.,
+        },
+    ]);
+
+    let output = layout.outputs().next().unwrap().clone();
+    layout.update_render_elements(Some(&output));
+
+    let mon = layout.active_monitor_ref().unwrap();
+    assert!(
+        !matches!(
+            mon.insert_hint.as_ref().map(|h| h.position),
+            Some(super::InsertPosition::Sidebar(_))
+        ),
+        "absent sidebar must not accept mid-panel drops; use edge strip only"
+    );
+}
+
+#[test]
+fn sidebar_output_windows_for_output_and_update_window() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+
+    let output = layout.outputs().next().unwrap().clone();
+    assert!(
+        layout
+            .windows_for_output(&output)
+            .any(|win| win.id() == &1),
+        "output-scoped sidebar window must be in windows_for_output (frame callbacks)"
+    );
+
+    // Commit plumbing must find the sidebar tile (no panic / no silent miss).
+    layout.update_window(&1, None);
+    layout.verify_invariants();
+
+    layout.activate_window_without_raising(&1);
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().sidebar_focus,
+        Some(niri_config::SidebarSide::Left)
+    );
+}
+
+#[test]
+fn dnd_hold_over_output_sidebar_does_not_panic() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+
+    // Focus a tiling window so the sidebar is not already focused.
+    layout.activate_window(&2);
+    assert!(layout.active_monitor_ref().unwrap().sidebar_focus.is_none());
+
+    let (px, py) = {
+        let mon = layout.active_monitor_ref().unwrap();
+        let panel = mon.left_sidebar.as_ref().unwrap().panel_rect();
+        (
+            panel.loc.x + panel.size.w / 2.,
+            panel.loc.y + panel.size.h / 2.,
+        )
+    };
+
+    let output = layout.outputs().next().unwrap().clone();
+    layout.dnd_update(output, Point::from((px, py)));
+
+    // First tick arms the hold timer; second tick past 750ms fires activation.
+    // Previously this panicked: workspace-only `.unwrap()` on output-scoped sidebars.
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AdvanceAnimations { msec_delta: 0 },
+            Op::AdvanceAnimations { msec_delta: 800 },
+        ],
+    );
+
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().sidebar_focus,
+        Some(niri_config::SidebarSide::Left),
+        "DnD hold over output sidebar must activate it without panicking"
+    );
+
+    layout.dnd_end();
+    layout.verify_invariants();
+}
+
+#[test]
+fn dnd_hold_over_scratchpad_does_not_panic() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_scratchpad(Some(&1));
+    layout.toggle_scratchpad();
+    layout.verify_invariants();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().scratchpad.shown_id(),
+        Some(&1)
+    );
+
+    layout.activate_window(&2);
+
+    let (px, py) = {
+        let mon = layout.active_monitor_ref().unwrap();
+        let (tile, tile_pos) = mon.scratchpad.shown_tile_pos().unwrap();
+        let size = tile.tile_size();
+        // Scratchpad hit-test is in workspace space; geo.loc is (0,0) with one output.
+        (tile_pos.x + size.w / 2., tile_pos.y + size.h / 2.)
+    };
+
+    assert_eq!(
+        layout
+            .active_monitor_ref()
+            .unwrap()
+            .window_under(Point::from((px, py)))
+            .map(|(w, _)| *w.id()),
+        Some(1),
+        "test pointer must hit the shown scratchpad window"
+    );
+
+    let output = layout.outputs().next().unwrap().clone();
+    layout.dnd_update(output, Point::from((px, py)));
+
+    // Must not panic: same workspace-only unwrap bug as output sidebars.
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::AdvanceAnimations { msec_delta: 0 },
+            Op::AdvanceAnimations { msec_delta: 800 },
+        ],
+    );
+
+    layout.dnd_end();
+    layout.verify_invariants();
+}
+
+#[test]
+fn sidebar_workspace_scope_update_window() {
+    let options = Options {
+        layout: niri_config::Layout {
+            sidebar: niri_config::Sidebar {
+                scope: niri_config::SidebarScope::Workspace,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_workspace_ref()
+        .left_sidebar
+        .as_ref()
+        .is_some_and(|s| s.contains(&1)));
+
+    layout.update_window(&1, None);
+    layout.verify_invariants();
+
+    layout.activate_window_without_raising(&1);
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_workspace_ref()
+        .left_sidebar
+        .as_ref()
+        .is_some_and(|s| s.is_focused()));
+}
+
+#[test]
+fn sidebar_output_scope_survives_workspace_switch_and_overview() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+
+    layout.switch_workspace_down();
+    // Finish the switch animation so only the active card remains on-screen.
+    for _ in 0..600 {
+        layout.advance_animations();
+        if layout
+            .active_monitor_ref()
+            .unwrap()
+            .workspace_switch
+            .is_none()
+        {
+            break;
+        }
+    }
+    layout.verify_invariants();
+    {
+        let mon = layout.active_monitor_ref().unwrap();
+        let idx = mon.active_workspace_idx();
+        assert!(idx >= 1, "regression needs active workspace index ≥ 1");
+        assert!(mon
+            .left_sidebar
+            .as_ref()
+            .is_some_and(|s| s.contains(&1)));
+        // Uncullled geo must resolve so render_workspaces can place scratchpad on the active card.
+        assert!(mon.active_workspace_render_geo().is_some());
+        // After settle, culled `.nth(idx)` is the old bug (often None when idx ≥ 1).
+        assert!(
+            mon.workspaces_with_render_geo().nth(idx).is_none(),
+            "culled geo .nth(active_idx) should miss after switch; use active_workspace_render_geo"
+        );
+        let output = mon.output().clone();
+        assert!(layout
+            .windows_for_output(&output)
+            .any(|win| win.id() == &1));
+    }
+
+    layout.toggle_overview();
+    layout.verify_invariants();
+    {
+        let mon = layout.active_monitor_ref().unwrap();
+        let sb = mon
+            .left_sidebar
+            .as_ref()
+            .expect("output sidebar must survive overview");
+        assert!(sb.contains(&1));
+        // Screen-space hit-test: fixed sidebars remain hittable while overview is open.
+        let panel = sb.panel_rect();
+        let pos = Point::from((
+            panel.loc.x + panel.size.w / 2.,
+            panel.loc.y + panel.size.h / 2.,
+        ));
+        let output = mon.output().clone();
+        let (win, _) = layout
+            .window_under(&output, pos)
+            .expect("output sidebar must hit-test in overview");
+        assert_eq!(win.id(), &1);
+    }
+    layout.toggle_overview();
+    layout.verify_invariants();
+}
+
+#[test]
+fn sidebar_scope_reload_migrates_to_output() {
+    let options = Options {
+        layout: niri_config::Layout {
+            sidebar: niri_config::Sidebar {
+                scope: niri_config::SidebarScope::Workspace,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut layout = check_ops_with_options(
+        options,
+        [
+            Op::AddOutput(1),
+            Op::AddWindow {
+                params: TestWindowParams::new(1),
+            },
+        ],
+    );
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_workspace_ref()
+        .left_sidebar
+        .as_ref()
+        .is_some_and(|s| s.contains(&1)));
+
+    Op::UpdateConfig {
+        layout_config: Box::new(niri_config::LayoutPart {
+            sidebar: Some(niri_config::SidebarPart {
+                scope: Some(niri_config::SidebarScope::Output),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    }
+    .apply(&mut layout);
+    layout.verify_invariants();
+
+    let mon = layout.active_monitor_ref().unwrap();
+    assert!(mon
+        .left_sidebar
+        .as_ref()
+        .is_some_and(|s| s.contains(&1)));
+    assert!(mon
+        .active_workspace_ref()
+        .left_sidebar
+        .as_ref()
+        .map(|s| !s.contains(&1))
+        .unwrap_or(true));
+}
+
+#[test]
+fn sidebar_toggle_and_cross_side_binds() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .is_some_and(|s| s.contains(&1)));
+
+    // Same side again toggles out.
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .is_none());
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Right, Some(&1));
+    layout.verify_invariants();
+    let mon = layout.active_monitor_ref().unwrap();
+    assert!(mon.left_sidebar.is_none());
+    assert!(mon
+        .right_sidebar
+        .as_ref()
+        .is_some_and(|s| s.contains(&1)));
+}
+
+#[test]
+fn sidebar_interactive_move_out_to_tiling() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    let output = layout.outputs().next().unwrap().clone();
+
+    assert!(layout.interactive_move_begin(1, &output, Point::from((50., 100.))));
+    // Cross start threshold with pointer mid-output (outside edge strip).
+    assert!(layout.interactive_move_update(
+        &1,
+        Point::from((300., 0.)),
+        output.clone(),
+        Point::from((640., 100.)),
+    ));
+    layout.interactive_move_end(&1);
+    layout.verify_invariants();
+
+    let mon = layout.active_monitor_ref().unwrap();
+    assert!(mon.left_sidebar.is_none());
+    assert!(mon.active_workspace_ref().has_window(&1));
+}
+
+#[test]
+fn sidebar_focus_column_left_right_enters_and_leaves() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.verify_invariants();
+
+    // Focus the remaining tiling window, then focus left at the edge → sidebar.
+    layout.activate_window(&2);
+    layout.focus_left();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().sidebar_focus,
+        Some(niri_config::SidebarSide::Left)
+    );
+
+    // Inward from left sidebar returns to tiling.
+    layout.focus_right();
+    assert!(layout
+        .active_monitor_ref()
+        .unwrap()
+        .sidebar_focus
+        .is_none());
+    assert_eq!(
+        layout
+            .active_workspace()
+            .and_then(|ws| ws.active_window())
+            .map(|w| *w.id()),
+        Some(2)
+    );
+}
+
+#[test]
+fn sidebar_active_window_visual_rectangle_follows_sidebar_focus() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.activate_window(&2);
+
+    let tiling_rect = layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_window_visual_rectangle()
+        .expect("tiling window visual rect");
+
+    layout.focus_left();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().sidebar_focus,
+        Some(niri_config::SidebarSide::Left)
+    );
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
+
+    let sidebar_rect = layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_window_visual_rectangle()
+        .expect("sidebar window visual rect");
+
+    // Left sidebar window should sit further left than the tiling column.
+    assert!(
+        sidebar_rect.loc.x < tiling_rect.loc.x,
+        "sidebar rect {sidebar_rect:?} should be left of tiling rect {tiling_rect:?}"
+    );
+}
+
+#[test]
+fn sidebar_focus_window_or_workspace_up_down_moves_within_stack() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&2));
+    layout.focus_sidebar(niri_config::SidebarSide::Left);
+    layout.verify_invariants();
+
+    // Last pushed window is active.
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+    assert!(layout.focus_up());
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
+    assert!(!layout.focus_up());
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
+
+    assert!(layout.focus_down());
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+    assert!(!layout.focus_down());
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+
+    // At the bottom of the stack, focus-window-or-workspace-down switches workspace.
+    let ws_idx_before = layout.active_monitor_ref().unwrap().active_workspace_idx();
+    layout.focus_window_or_workspace_down();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().active_workspace_idx(),
+        ws_idx_before + 1
+    );
+
+    // Still on the sidebar; walk to the top, then focus-window-or-workspace-up returns.
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().sidebar_focus,
+        Some(niri_config::SidebarSide::Left)
+    );
+    assert!(layout.focus_up());
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(1));
+    assert!(!layout.focus_up());
+
+    layout.focus_window_or_workspace_up();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().active_workspace_idx(),
+        ws_idx_before
+    );
+}
+
+#[test]
+fn sidebar_move_window_up_down_reorders_stack() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+    ]);
+
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&1));
+    layout.move_window_to_sidebar(niri_config::SidebarSide::Left, Some(&2));
+    layout.focus_sidebar(niri_config::SidebarSide::Left);
+    layout.verify_invariants();
+
+    // Push order: 1 on top, 2 active at bottom.
+    let ids: Vec<_> = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .windows()
+        .map(|w| *w.id())
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+
+    layout.move_up();
+    layout.verify_invariants();
+    let ids: Vec<_> = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .windows()
+        .map(|w| *w.id())
+        .collect();
+    assert_eq!(ids, vec![2, 1]);
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+
+    // Already at top: no-op.
+    layout.move_up();
+    layout.verify_invariants();
+    let ids: Vec<_> = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .windows()
+        .map(|w| *w.id())
+        .collect();
+    assert_eq!(ids, vec![2, 1]);
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+
+    layout.move_down();
+    layout.verify_invariants();
+    let ids: Vec<_> = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .windows()
+        .map(|w| *w.id())
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+
+    // Already at bottom: no-op (and or-to-workspace must not switch workspaces).
+    let ws_idx_before = layout.active_monitor_ref().unwrap().active_workspace_idx();
+    layout.move_down();
+    layout.move_down_or_to_workspace_down();
+    layout.verify_invariants();
+    assert_eq!(
+        layout.active_monitor_ref().unwrap().active_workspace_idx(),
+        ws_idx_before
+    );
+    let ids: Vec<_> = layout
+        .active_monitor_ref()
+        .unwrap()
+        .left_sidebar
+        .as_ref()
+        .unwrap()
+        .windows()
+        .map(|w| *w.id())
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(layout.focus().map(|w| *w.id()), Some(2));
+}
+
+#[test]
 fn move_column_to_workspace_down_focus_false_on_floating_window() {
     let ops = [
         Op::AddOutput(1),
@@ -3801,6 +5893,13 @@ fn arbitrary_center_focused_column() -> impl Strategy<Value = CenterFocusedColum
     ]
 }
 
+fn arbitrary_center_visible_columns() -> impl Strategy<Value = CenterVisibleColumns> {
+    prop_oneof![
+        Just(CenterVisibleColumns::Never),
+        Just(CenterVisibleColumns::Always),
+    ]
+}
+
 fn arbitrary_tab_indicator_position() -> impl Strategy<Value = TabIndicatorPosition> {
     prop_oneof![
         Just(TabIndicatorPosition::Left),
@@ -3877,6 +5976,234 @@ prop_compose! {
     }
 }
 
+fn test_output(name: &str, size: (i32, i32)) -> Output {
+    let output = Output::new(
+        name.to_owned(),
+        PhysicalProperties {
+            size: Size::from(size),
+            subpixel: Subpixel::Unknown,
+            make: String::new(),
+            model: String::new(),
+            serial_number: String::new(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: Size::from(size),
+            refresh: 60000,
+        }),
+        None,
+        None,
+        None,
+    );
+    output.user_data().insert_if_missing(|| OutputName {
+        connector: name.to_owned(),
+        make: None,
+        model: None,
+        serial: None,
+    });
+    output
+}
+
+fn requested_size(layout: &Layout<TestWindow>, id: usize) -> Size<i32, Logical> {
+    layout
+        .windows()
+        .find(|(_, window)| *window.id() == id)
+        .unwrap()
+        .1
+        .requested_size()
+        .unwrap()
+}
+
+fn scrolling_positions(
+    layout: &Layout<TestWindow>,
+    output: &Output,
+) -> Vec<(usize, Point<f64, Logical>)> {
+    let mon = layout.monitor_for_output(output).unwrap();
+    mon.active_workspace_ref()
+        .tiles_with_render_positions()
+        .map(|(tile, pos, _)| (*tile.window().id(), pos))
+        .collect()
+}
+
+#[test]
+fn vertical_main_axis_opens_rows_and_focuses_down() {
+    let mut layout = Layout::default();
+    let horizontal = test_output("DP-1", (1920, 1080));
+    let vertical = test_output("DP-2", (1080, 1920));
+    layout.add_output(horizontal.clone(), None);
+    layout.add_output(
+        vertical.clone(),
+        Some(niri_config::LayoutPart {
+            main_axis: Some(niri_config::MainAxis::Vertical),
+            ..Default::default()
+        }),
+    );
+
+    layout.add_window(
+        TestWindow::new(TestWindowParams::new(1)),
+        AddWindowTarget::Output(&horizontal),
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::Yes,
+    );
+    layout.add_window(
+        TestWindow::new(TestWindowParams::new(2)),
+        AddWindowTarget::Output(&horizontal),
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::No,
+    );
+    layout.verify_invariants();
+
+    let horizontal_pos = scrolling_positions(&layout, &horizontal);
+    let first = horizontal_pos.iter().find(|(id, _)| *id == 1).unwrap().1;
+    let second = horizontal_pos.iter().find(|(id, _)| *id == 2).unwrap().1;
+    assert!(
+        second.x > first.x + 100.,
+        "horizontal layout places the next window to the right: {first:?} {second:?}"
+    );
+    assert!(
+        (second.y - first.y).abs() < 2.,
+        "columns share the top of the working area: {first:?} {second:?}"
+    );
+
+    layout.focus_output(&horizontal);
+    assert_eq!(layout.focus().unwrap().id(), &1usize);
+    assert!(
+        !layout.focus_down(),
+        "screen-down stays inside a single-window column"
+    );
+    assert_eq!(layout.focus().unwrap().id(), &1usize);
+
+    layout.add_window(
+        TestWindow::new(TestWindowParams::new(3)),
+        AddWindowTarget::Output(&vertical),
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::Yes,
+    );
+    layout.add_window(
+        TestWindow::new(TestWindowParams::new(4)),
+        AddWindowTarget::Output(&vertical),
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::No,
+    );
+    layout.verify_invariants();
+
+    let vertical_pos = scrolling_positions(&layout, &vertical);
+    let first = vertical_pos.iter().find(|(id, _)| *id == 3).unwrap().1;
+    let second = vertical_pos.iter().find(|(id, _)| *id == 4).unwrap().1;
+    assert!(
+        second.y > first.y + 100.,
+        "vertical layout places the next window below: {first:?} {second:?}"
+    );
+    assert!(
+        (second.x - first.x).abs() < 2.,
+        "rows share the left of the working area: {first:?} {second:?}"
+    );
+
+    layout.focus_output(&vertical);
+    assert_eq!(layout.focus().unwrap().id(), &3usize);
+    assert!(layout.focus_down());
+    assert_eq!(
+        layout.focus().unwrap().id(),
+        &4usize,
+        "screen-down moves to the next row"
+    );
+}
+
+#[test]
+fn moving_between_outputs_converts_column_and_row() {
+    let mut layout = Layout::default();
+    let horizontal = test_output("DP-1", (1920, 1080));
+    let vertical = test_output("DP-2", (1080, 1920));
+    layout.add_output(horizontal.clone(), None);
+    layout.add_output(
+        vertical.clone(),
+        Some(niri_config::LayoutPart {
+            main_axis: Some(niri_config::MainAxis::Vertical),
+            ..Default::default()
+        }),
+    );
+
+    layout.add_window(
+        TestWindow::new(TestWindowParams::new(1)),
+        AddWindowTarget::Output(&horizontal),
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::Yes,
+    );
+    let column_size = requested_size(&layout, 1);
+    // Default column width is half the strip. On the landscape output that is the width.
+    assert!(column_size.w < column_size.h);
+    assert!(column_size.w < 1920 / 2 + 32);
+
+    layout.move_to_output(Some(&1), &vertical, None, ActivateWindow::Yes);
+    layout.verify_invariants();
+    let row_size = requested_size(&layout, 1);
+    // The proportion becomes row height, and the window spans the portrait working width.
+    assert!(
+        row_size.w > 1000,
+        "row uses the destination working width, got {row_size:?}"
+    );
+    assert!(
+        row_size.h < row_size.w,
+        "row height comes from the previous column width, got {row_size:?}"
+    );
+    assert_ne!(row_size, column_size);
+
+    layout.move_to_output(Some(&1), &horizontal, None, ActivateWindow::Yes);
+    layout.verify_invariants();
+    assert_eq!(requested_size(&layout, 1), column_size);
+
+    layout.add_window(
+        TestWindow::new(TestWindowParams::new(2)),
+        AddWindowTarget::Output(&horizontal),
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::Yes,
+    );
+    let column_size = requested_size(&layout, 2);
+    assert!(layout.interactive_move_begin(2, &horizontal, Point::from((100., 100.))));
+    assert!(layout.interactive_move_update(
+        &2,
+        Point::from((400., 0.)),
+        vertical.clone(),
+        Point::from((200., 200.)),
+    ));
+    let preview = requested_size(&layout, 2);
+    assert!(
+        preview.w > 1000 && preview.h < preview.w,
+        "drag preview retile to a row, got {preview:?} from column {column_size:?}"
+    );
+
+    layout.interactive_move_end(&2);
+    layout.verify_invariants();
+    let dropped = requested_size(&layout, 2);
+    assert!(
+        dropped.w > 1000 && dropped.h < dropped.w,
+        "dropping commits the row, got {dropped:?}"
+    );
+
+    layout.move_to_output(Some(&2), &horizontal, None, ActivateWindow::Yes);
+    layout.verify_invariants();
+    assert_eq!(requested_size(&layout, 2), column_size);
+}
+
 prop_compose! {
     fn arbitrary_layout_part()(
         gaps in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
@@ -3886,6 +6213,7 @@ prop_compose! {
         shadow in prop::option::of(arbitrary_shadow()),
         tab_indicator in prop::option::of(arbitrary_tab_indicator()),
         center_focused_column in prop::option::of(arbitrary_center_focused_column()),
+        center_visible_columns in prop::option::of(arbitrary_center_visible_columns()),
         always_center_single_column in prop::option::of(any::<bool>().prop_map(Flag)),
         empty_workspace_above_first in prop::option::of(any::<bool>().prop_map(Flag)),
     ) -> niri_config::LayoutPart {
@@ -3893,6 +6221,7 @@ prop_compose! {
             gaps,
             struts,
             center_focused_column,
+            center_visible_columns,
             always_center_single_column,
             empty_workspace_above_first,
             focus_ring,

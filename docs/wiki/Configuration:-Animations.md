@@ -62,6 +62,10 @@ animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
     }
+
+    sidebar-open-close {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    }
 }
 ```
 
@@ -436,6 +440,18 @@ The close fade-out animation of the recent windows switcher.
 animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
+    }
+}
+```
+
+#### `sidebar-open-close`
+
+The show/hide slide animation of [sidebars](./Sidebars.md), and the peek open/close of the sidebar shortcuts dock. Discrete sidebar width changes animate sidebar tiles with `window-resize`; the tiling strip tracks the inset without a resize animation. Interactive edge resize is not animated.
+
+```kdl
+animations {
+    sidebar-open-close {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
     }
 }
 ```

@@ -46,6 +46,7 @@ pub mod resources;
 pub mod shader_element;
 pub mod shaders;
 pub mod shadow;
+pub mod sidebar_chrome;
 pub mod snapshot;
 pub mod solid_color;
 pub mod surface;

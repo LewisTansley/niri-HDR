@@ -21,6 +21,11 @@ gestures {
         max-speed 1500
     }
 
+    sidebar-edge-drop {
+        trigger-width 20
+        delay-ms 150
+    }
+
     hot-corners {
         // off
         top-left
@@ -52,6 +57,23 @@ gestures {
     dnd-edge-view-scroll {
         trigger-width 100
         max-speed 3000
+    }
+}
+```
+
+### `sidebar-edge-drop`
+
+When interactively moving a window (Mod + drag), releasing near the far left or right edge of the output drops the window into that [sidebar](./Sidebars.md) instead of inserting a new column.
+
+The same `trigger-width` and `delay-ms` also control the hover-reveal of the [sidebar shortcuts dock](./Sidebars.md#shortcuts-dock) when the sidebar is hidden.
+
+This uses a separate trigger strip from `dnd-edge-view-scroll` so the two gestures do not fight as much. Prefer a narrower `trigger-width` than the DnD scroll zone.
+
+```kdl
+gestures {
+    sidebar-edge-drop {
+        trigger-width 20
+        delay-ms 150
     }
 }
 ```

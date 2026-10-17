@@ -14,6 +14,7 @@ pub struct Shaders {
     pub texture_hdr: Option<GlesTexProgram>,
     pub texture_hdr_to_sdr: Option<GlesTexProgram>,
     pub border: Option<ShaderProgram>,
+    pub sidebar_chrome: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
@@ -28,6 +29,7 @@ pub struct Shaders {
 #[derive(Debug, Clone, Copy)]
 pub enum ProgramType {
     Border,
+    SidebarChrome,
     Shadow,
     Resize,
     Close,
@@ -91,6 +93,27 @@ impl Shaders {
         )
         .map_err(|err| {
             warn!("error compiling border shader: {err:?}");
+        })
+        .ok();
+
+        let sidebar_chrome = ShaderProgram::compile(
+            renderer,
+            include_str!("sidebar_chrome.frag"),
+            &[
+                UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                UniformName::new("geo_size", UniformType::_2f),
+                UniformName::new("color", UniformType::_4f),
+                UniformName::new("fill_color", UniformType::_4f),
+                UniformName::new("has_fill", UniformType::_1f),
+                UniformName::new("side", UniformType::_1f),
+                UniformName::new("scoop_radius", UniformType::_1f),
+                UniformName::new("panel_width", UniformType::_1f),
+                UniformName::new("border_width", UniformType::_1f),
+            ],
+            &[],
+        )
+        .map_err(|err| {
+            warn!("error compiling sidebar chrome shader: {err:?}");
         })
         .ok();
 
@@ -215,6 +238,7 @@ impl Shaders {
             texture_hdr,
             texture_hdr_to_sdr,
             border,
+            sidebar_chrome,
             shadow,
             clipped_surface,
             postprocess_and_clip,
@@ -264,6 +288,7 @@ impl Shaders {
     pub fn program(&self, program: ProgramType) -> Option<ShaderProgram> {
         match program {
             ProgramType::Border => self.border.clone(),
+            ProgramType::SidebarChrome => self.sidebar_chrome.clone(),
             ProgramType::Shadow => self.shadow.clone(),
             ProgramType::Resize => self
                 .custom_resize

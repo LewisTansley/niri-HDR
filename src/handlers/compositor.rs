@@ -234,6 +234,9 @@ impl CompositorHandler for State {
                         error!("layout is missing the window that we just added");
                     }
 
+                    // Sidebar shortcut spawn → dock into the requested sidebar.
+                    self.try_fulfill_pending_sidebar_open(&window);
+
                     if let Some(output) = output {
                         self.niri.layout.start_open_animation_for_window(&window);
 

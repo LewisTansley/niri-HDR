@@ -177,6 +177,9 @@ use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::sidebar_shortcuts::SidebarShortcutsUi;
+use crate::utils::dms_theme::DmsThemeCache;
+use crate::utils::sidebar_shortcuts_state::SidebarShortcutsStore;
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -399,6 +402,13 @@ pub struct Niri {
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
+
+    pub sidebar_shortcuts_ui: SidebarShortcutsUi,
+    pub sidebar_shortcuts: SidebarShortcutsStore,
+    /// Spawned shortcuts waiting for a matching window to map into a sidebar.
+    pub pending_sidebar_opens: Vec<PendingSidebarOpen>,
+    /// Live DankMaterialShell theme for sidebar chrome.
+    pub dms_theme_cache: DmsThemeCache,
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
@@ -641,6 +651,14 @@ pub struct PendingMruCommit {
     stamp: Duration,
 }
 
+/// A spawned sidebar shortcut waiting for its window to appear.
+#[derive(Debug, Clone)]
+pub struct PendingSidebarOpen {
+    pub app_id: String,
+    pub side: niri_config::SidebarSide,
+    pub created: std::time::Instant,
+}
+
 impl RedrawState {
     fn queue_redraw(self) -> Self {
         match self {
@@ -825,6 +843,7 @@ impl State {
         self.niri.global_space.refresh();
         self.niri.refresh_idle_inhibit();
         self.niri.refresh_color_management();
+        self.niri.refresh_dms_theme();
         self.refresh_pointer_contents();
         foreign_toplevel::refresh(self);
         ext_workspace::refresh(self);
@@ -1701,6 +1720,11 @@ impl State {
 
         if recent_windows_changed {
             self.niri.window_mru_ui.update_config();
+        }
+
+        {
+            let sidebar = self.niri.config.borrow().layout.sidebar.clone();
+            self.niri.sidebar_shortcuts.apply_config_seed(&sidebar);
         }
 
         if xwls_changed {
@@ -2642,6 +2666,9 @@ impl Niri {
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
         let window_mru_ui = WindowMruUi::new(config.clone());
+        let sidebar_shortcuts_ui =
+            SidebarShortcutsUi::new(animation_clock.clone(), config.clone());
+        let sidebar_shortcuts = SidebarShortcutsStore::load(&config_.layout.sidebar);
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
 
@@ -2838,6 +2865,11 @@ impl Niri {
 
             window_mru_ui,
             pending_mru_commit: None,
+
+            sidebar_shortcuts_ui,
+            sidebar_shortcuts,
+            pending_sidebar_opens: Vec::new(),
+            dms_theme_cache: DmsThemeCache::new(),
 
             pick_window: None,
             pick_color: None,
@@ -4251,6 +4283,20 @@ impl Niri {
         drop(config);
     }
 
+    pub fn refresh_dms_theme(&mut self) {
+        if !self.config.borrow().layout.sidebar.use_dms_theme {
+            self.layout.set_dms_sidebar_theme(None);
+            return;
+        }
+
+        let changed = self.dms_theme_cache.refresh();
+        self.layout
+            .set_dms_sidebar_theme(self.dms_theme_cache.theme());
+        if changed {
+            self.queue_redraw_all();
+        }
+    }
+
     pub fn refresh_window_rules(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_window_rules");
 
@@ -4294,6 +4340,7 @@ impl Niri {
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
+        self.sidebar_shortcuts_ui.advance_animations();
 
         for state in self.output_state.values_mut() {
             if let Some(transition) = &mut state.screen_transition {
@@ -4522,6 +4569,57 @@ impl Niri {
         // Then, the Alt-Tab switcher.
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+
+        // Sidebar shortcuts dock (edge hover).
+        if let Some(working_area) = self
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.working_area())
+        {
+            let scale = output.current_scale().fractional_scale();
+            let dock_chrome = {
+                use crate::ui::sidebar_shortcuts::DockChrome;
+                let cfg = self.config.borrow();
+                let sb = &cfg.layout.sidebar;
+                let dms = sb
+                    .use_dms_theme
+                    .then(|| self.dms_theme_cache.theme())
+                    .flatten();
+                let (border_off, border_width, border_color, fill, radius) =
+                    crate::layout::sidebar::resolve_chrome(sb, dms.as_ref(), false);
+                let fill = fill.unwrap_or_else(|| {
+                    dms.map(|t| t.background_color)
+                        .unwrap_or_else(|| DockChrome::default_fallback().fill)
+                });
+                DockChrome {
+                    fill,
+                    border_color,
+                    border_width,
+                    draw_border: !border_off && border_width > 0.,
+                    corner_radius: radius,
+                }
+            };
+            let sharing = self.config.borrow().layout.sidebar.shortcuts_sharing;
+            for side in [niri_config::SidebarSide::Left, niri_config::SidebarSide::Right] {
+                let shortcuts = self.sidebar_shortcuts.visible(side, sharing);
+                self.sidebar_shortcuts_ui.render(
+                    ctx.renderer,
+                    side,
+                    working_area,
+                    &shortcuts,
+                    scale,
+                    dock_chrome,
+                    &mut |elem| match elem {
+                        crate::ui::sidebar_shortcuts::SidebarShortcutsRenderElement::Border(e) => {
+                            push(e.into())
+                        }
+                        crate::ui::sidebar_shortcuts::SidebarShortcutsRenderElement::Texture(e) => {
+                            push(e.into())
+                        }
+                    },
+                );
+            }
+        }
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
@@ -4838,6 +4936,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.sidebar_shortcuts_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
@@ -6801,6 +6900,7 @@ niri_render_elements! {
         Pointer = PointerRenderElements<R>,
         Wayland = BlendSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
+        Border = crate::render_helpers::border::BorderRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,

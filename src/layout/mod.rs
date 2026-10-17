@@ -31,6 +31,7 @@
 //! workspace just like any other. Then they come back, reconnect the second monitor, and now we
 //! don't want an unassuming workspace to end up on it.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
@@ -39,7 +40,8 @@ use std::time::Duration;
 use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
 use niri_config::utils::MergeWith as _;
 use niri_config::{
-    Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
+    Config, CornerRadius, LayoutPart, PresetSize, SidebarScope, SidebarSide,
+    Workspace as WorkspaceConfig, WorkspaceReference,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
@@ -68,6 +70,7 @@ use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{BakedBuffer, RenderCtx};
 use crate::rubber_band::RubberBand;
+use crate::utils::dms_theme::DmsSidebarTheme;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{
     ensure_min_max_size_maybe_zero, output_matches_name, output_size,
@@ -75,14 +78,17 @@ use crate::utils::{
 };
 use crate::window::ResolvedWindowRules;
 
+pub mod axis;
 pub mod closing_window;
 pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod monitor;
 pub mod opening_window;
+pub mod scratchpad;
 pub mod scrolling;
 pub mod shadow;
+pub mod sidebar;
 pub mod tab_indicator;
 pub mod tile;
 pub mod workspace;
@@ -393,6 +399,8 @@ pub struct Options {
     pub gestures: niri_config::Gestures,
     pub overview: niri_config::Overview,
     pub blur: niri_config::Blur,
+    /// Live DMS palette for sidebar chrome; shared across cloned [`Options`].
+    pub dms_sidebar_theme: Rc<RefCell<Option<DmsSidebarTheme>>>,
     // Debug flags.
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
@@ -412,6 +420,8 @@ enum InteractiveMoveState<W: LayoutElement> {
         ///
         /// This helps the pointer remain inside the window as it resizes.
         pointer_ratio_within_window: (f64, f64),
+        /// Sidebar the window was dragged out of, if any (for home-edge anti-redock).
+        from_sidebar: Option<SidebarSide>,
     },
     /// Moving; the window is no longer in the layout.
     Moving(InteractiveMoveData<W>),
@@ -445,6 +455,12 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
+    /// Sidebar the window was dragged out of, if any.
+    pub(self) from_sidebar: Option<SidebarSide>,
+    /// True once the pointer has left the origin sidebar latch zone (panel or edge strip).
+    pub(self) left_origin_edge: bool,
+    /// Origin sidebar panel in output space, captured before an emptied sidebar is discarded.
+    pub(self) origin_sidebar_panel_rect: Option<Rectangle<f64, Logical>>,
 }
 
 #[derive(Debug)]
@@ -654,6 +670,7 @@ impl Options {
             gestures: config.gestures,
             overview: config.overview,
             blur: config.blur,
+            dms_sidebar_theme: Rc::new(RefCell::new(None)),
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
             deactivate_unfocused_windows: config.debug.deactivate_unfocused_windows,
@@ -1152,6 +1169,30 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    if mon.scratchpad.contains(window) {
+                        return mon.scratchpad.remove(window);
+                    }
+                    if mon.left_sidebar.as_ref().is_some_and(|s| s.contains(window)) {
+                        let removed = mon.left_sidebar.as_mut().unwrap().remove(window);
+                        if mon.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+                            mon.left_sidebar = None;
+                        }
+                        mon.sync_sidebar_insets();
+                        return removed;
+                    }
+                    if mon
+                        .right_sidebar
+                        .as_ref()
+                        .is_some_and(|s| s.contains(window))
+                    {
+                        let removed = mon.right_sidebar.as_mut().unwrap().remove(window);
+                        if mon.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+                            mon.right_sidebar = None;
+                        }
+                        mon.sync_sidebar_insets();
+                        return removed;
+                    }
+
                     for (idx, ws) in mon.workspaces.iter_mut().enumerate() {
                         if ws.has_window(window) {
                             let removed = ws.remove_tile(window, transaction);
@@ -1180,6 +1221,7 @@ impl<W: LayoutElement> Layout<W> {
                                 mon.workspaces.remove(1);
                                 mon.active_workspace_idx = 0;
                             }
+                            mon.sync_sidebar_insets();
                             return Some(removed);
                         }
                     }
@@ -1230,6 +1272,23 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    if mon.scratchpad.update_window(window, serial) {
+                        return;
+                    }
+                    if mon
+                        .left_sidebar
+                        .as_mut()
+                        .is_some_and(|s| s.update_window(window, serial))
+                    {
+                        return;
+                    }
+                    if mon
+                        .right_sidebar
+                        .as_mut()
+                        .is_some_and(|s| s.update_window(window, serial))
+                    {
+                        return;
+                    }
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
                             ws.update_window(window, serial);
@@ -1377,6 +1436,21 @@ impl<W: LayoutElement> Layout<W> {
                             return Some((window, Some(&mon.output)));
                         }
                     }
+
+                    if let Some(window) = mon.scratchpad.windows().find(|w| w.is_wl_surface(wl_surface))
+                    {
+                        return Some((window, Some(&mon.output)));
+                    }
+                    if let Some(sb) = &mon.left_sidebar {
+                        if let Some(window) = sb.windows().find(|w| w.is_wl_surface(wl_surface)) {
+                            return Some((window, Some(&mon.output)));
+                        }
+                    }
+                    if let Some(sb) = &mon.right_sidebar {
+                        if let Some(window) = sb.windows().find(|w| w.is_wl_surface(wl_surface)) {
+                            return Some((window, Some(&mon.output)));
+                        }
+                    }
                 }
             }
             MonitorSet::NoOutputs { workspaces } => {
@@ -1406,6 +1480,26 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
                         if let Some(window) = ws.find_wl_surface_mut(wl_surface) {
+                            return Some((window, Some(&mon.output)));
+                        }
+                    }
+
+                    if let Some(window) = mon
+                        .scratchpad
+                        .windows_mut()
+                        .find(|w| w.is_wl_surface(wl_surface))
+                    {
+                        return Some((window, Some(&mon.output)));
+                    }
+                    if let Some(sb) = &mut mon.left_sidebar {
+                        if let Some(window) = sb.windows_mut().find(|w| w.is_wl_surface(wl_surface))
+                        {
+                            return Some((window, Some(&mon.output)));
+                        }
+                    }
+                    if let Some(sb) = &mut mon.right_sidebar {
+                        if let Some(window) = sb.windows_mut().find(|w| w.is_wl_surface(wl_surface))
+                        {
                             return Some((window, Some(&mon.output)));
                         }
                     }
@@ -1442,9 +1536,33 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        self.workspaces()
+        if let Some(rect) = self
+            .workspaces()
             .find_map(|(_, _, ws)| ws.popup_target_rect(window))
-            .unwrap()
+        {
+            return rect;
+        }
+
+        if let MonitorSet::Normal { monitors, .. } = &self.monitor_set {
+            for mon in monitors {
+                if let Some(rect) = mon.scratchpad.popup_target_rect(window) {
+                    return rect;
+                }
+                if let Some(sb) = &mon.left_sidebar {
+                    if let Some(rect) = sb.popup_target_rect(window) {
+                        return rect;
+                    }
+                }
+                if let Some(sb) = &mon.right_sidebar {
+                    if let Some(rect) = sb.popup_target_rect(window) {
+                        return rect;
+                    }
+                }
+            }
+        }
+
+        // Safe fallback: never panic if a window is briefly untracked.
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     pub fn update_output_size(&mut self, output: &Output) {
@@ -1493,15 +1611,23 @@ impl<W: LayoutElement> Layout<W> {
             return true;
         };
 
-        let (mon, ws_idx) = monitors
-            .iter()
-            .find_map(|mon| {
-                mon.workspaces
-                    .iter()
-                    .position(|ws| ws.has_window(window))
-                    .map(|ws_idx| (mon, ws_idx))
-            })
-            .unwrap();
+        // Output-scoped sidebars / scratchpad stick to the monitor across workspace switches.
+        if monitors.iter().any(|mon| {
+            mon.scratchpad.contains(window)
+                || mon.left_sidebar.as_ref().is_some_and(|s| s.contains(window))
+                || mon.right_sidebar.as_ref().is_some_and(|s| s.contains(window))
+        }) {
+            return true;
+        }
+
+        let Some((mon, ws_idx)) = monitors.iter().find_map(|mon| {
+            mon.workspaces
+                .iter()
+                .position(|ws| ws.has_window(window))
+                .map(|ws_idx| (mon, ws_idx))
+        }) else {
+            return true;
+        };
 
         // During a gesture, focus-follows-mouse does not cause any unintended workspace switches.
         if let Some(WorkspaceSwitch::Gesture(_)) = mon.workspace_switch {
@@ -1528,9 +1654,57 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         for (monitor_idx, mon) in monitors.iter_mut().enumerate() {
+            if mon.scratchpad.contains(window) {
+                *active_monitor_idx = monitor_idx;
+                mon.scratchpad.show_mru();
+                // Ensure the shown id is this window by cycling if needed.
+                while mon.scratchpad.shown_id() != Some(window)
+                    && mon.scratchpad.contains(window)
+                {
+                    mon.scratchpad.cycle(true);
+                    if mon.scratchpad.mru_id() == Some(window) {
+                        mon.scratchpad.show_mru();
+                        break;
+                    }
+                }
+                // Raise this window to MRU if not already.
+                if mon.scratchpad.mru_id() != Some(window) {
+                    if let Some(removed) = mon.scratchpad.remove(window) {
+                        mon.scratchpad.push(removed);
+                        mon.scratchpad.show_mru();
+                    }
+                }
+                mon.clear_output_sidebar_focus();
+                return;
+            }
+
+            if mon.left_sidebar.as_mut().is_some_and(|s| s.activate_window(window)) {
+                *active_monitor_idx = monitor_idx;
+                mon.sidebar_focus = Some(SidebarSide::Left);
+                if let Some(sb) = &mut mon.right_sidebar {
+                    sb.set_focused(false);
+                }
+                mon.active_workspace().clear_sidebar_focus();
+                return;
+            }
+            if mon
+                .right_sidebar
+                .as_mut()
+                .is_some_and(|s| s.activate_window(window))
+            {
+                *active_monitor_idx = monitor_idx;
+                mon.sidebar_focus = Some(SidebarSide::Right);
+                if let Some(sb) = &mut mon.left_sidebar {
+                    sb.set_focused(false);
+                }
+                mon.active_workspace().clear_sidebar_focus();
+                return;
+            }
+
             for (workspace_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                 if ws.activate_window(window) {
                     *active_monitor_idx = monitor_idx;
+                    mon.clear_output_sidebar_focus();
 
                     // If currently in the middle of a vertical swipe between the target workspace
                     // and some other, don't switch the workspace.
@@ -1541,6 +1715,7 @@ impl<W: LayoutElement> Layout<W> {
                         _ => mon.switch_workspace(workspace_idx),
                     }
 
+                    mon.update_sidebar_auto_hide();
                     return;
                 }
             }
@@ -1564,9 +1739,44 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         for (monitor_idx, mon) in monitors.iter_mut().enumerate() {
+            if mon.scratchpad.contains(window) {
+                *active_monitor_idx = monitor_idx;
+                // Hit-test only finds the shown overlay; do not reorder the stack.
+                mon.clear_output_sidebar_focus();
+                return;
+            }
+
+            if mon
+                .left_sidebar
+                .as_mut()
+                .is_some_and(|s| s.activate_window(window))
+            {
+                *active_monitor_idx = monitor_idx;
+                mon.sidebar_focus = Some(SidebarSide::Left);
+                if let Some(sb) = &mut mon.right_sidebar {
+                    sb.set_focused(false);
+                }
+                mon.active_workspace().clear_sidebar_focus();
+                return;
+            }
+            if mon
+                .right_sidebar
+                .as_mut()
+                .is_some_and(|s| s.activate_window(window))
+            {
+                *active_monitor_idx = monitor_idx;
+                mon.sidebar_focus = Some(SidebarSide::Right);
+                if let Some(sb) = &mut mon.left_sidebar {
+                    sb.set_focused(false);
+                }
+                mon.active_workspace().clear_sidebar_focus();
+                return;
+            }
+
             for (workspace_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                 if ws.activate_window_without_raising(window) {
                     *active_monitor_idx = monitor_idx;
+                    mon.clear_output_sidebar_focus();
 
                     // If currently in the middle of a vertical swipe between the target workspace
                     // and some other, don't switch the workspace.
@@ -1639,8 +1849,13 @@ impl<W: LayoutElement> Layout<W> {
 
         let mon = monitors.iter().find(|mon| &mon.output == output).unwrap();
         let mon_windows = mon.workspaces.iter().flat_map(|ws| ws.windows());
+        let output_stores = mon
+            .scratchpad
+            .windows()
+            .chain(mon.left_sidebar.iter().flat_map(|s| s.windows()))
+            .chain(mon.right_sidebar.iter().flat_map(|s| s.windows()));
 
-        moving_window.chain(mon_windows)
+        moving_window.chain(mon_windows).chain(output_stores)
     }
 
     pub fn windows_for_output_mut(&mut self, output: &Output) -> impl Iterator<Item = &mut W> + '_ {
@@ -1661,8 +1876,13 @@ impl<W: LayoutElement> Layout<W> {
             .find(|mon| &mon.output == output)
             .unwrap();
         let mon_windows = mon.workspaces.iter_mut().flat_map(|ws| ws.windows_mut());
+        let output_stores = mon
+            .scratchpad
+            .windows_mut()
+            .chain(mon.left_sidebar.iter_mut().flat_map(|s| s.windows_mut()))
+            .chain(mon.right_sidebar.iter_mut().flat_map(|s| s.windows_mut()));
 
-        moving_window.chain(mon_windows)
+        moving_window.chain(mon_windows).chain(output_stores)
     }
 
     pub fn with_windows(
@@ -1846,17 +2066,73 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_down(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        if let Some(mon) = self.active_monitor() {
+            if let Some(side) = mon.sidebar_focus {
+                match side {
+                    SidebarSide::Left => {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            sb.move_down();
+                            return;
+                        }
+                    }
+                    SidebarSide::Right => {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            sb.move_down();
+                            return;
+                        }
+                    }
+                }
+            }
+            let ws = mon.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_down();
+                return;
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_down();
+                return;
+            }
+            ws.move_down();
             return;
-        };
-        workspace.move_down();
+        }
+        if let Some(workspace) = self.active_workspace_mut() {
+            workspace.move_down();
+        }
     }
 
     pub fn move_up(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        if let Some(mon) = self.active_monitor() {
+            if let Some(side) = mon.sidebar_focus {
+                match side {
+                    SidebarSide::Left => {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            sb.move_up();
+                            return;
+                        }
+                    }
+                    SidebarSide::Right => {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            sb.move_up();
+                            return;
+                        }
+                    }
+                }
+            }
+            let ws = mon.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_up();
+                return;
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_up();
+                return;
+            }
+            ws.move_up();
             return;
-        };
-        workspace.move_up();
+        }
+        if let Some(workspace) = self.active_workspace_mut() {
+            workspace.move_up();
+        }
     }
 
     pub fn move_down_or_to_workspace_down(&mut self) {
@@ -1920,17 +2196,123 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_left(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
-            return;
-        };
-        workspace.focus_left();
+        self.focus_left_inner();
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
     }
 
     pub fn focus_right(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
-            return;
+        self.focus_right_inner();
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
+    }
+
+    /// Returns true if focus moved within the monitor (including into/out of a sidebar).
+    fn focus_left_inner(&mut self) -> bool {
+        let Some(mon) = self.active_monitor() else {
+            if let Some(workspace) = self.active_workspace_mut() {
+                return workspace.focus_left();
+            }
+            return false;
         };
-        workspace.focus_right();
+
+        // From a focused sidebar: inward leaves to tiling; outward is a no-op.
+        if let Some(side) = mon.sidebar_focus {
+            match side {
+                SidebarSide::Left => return true,
+                SidebarSide::Right => {
+                    mon.clear_output_sidebar_focus();
+                    mon.active_workspace().focus_column_last();
+                    return true;
+                }
+            }
+        }
+        {
+            let ws = mon.active_workspace();
+            if ws.left_sidebar.as_ref().is_some_and(|s| s.is_focused()) {
+                return true;
+            }
+            if ws.right_sidebar.as_ref().is_some_and(|s| s.is_focused()) {
+                ws.clear_sidebar_focus();
+                ws.focus_column_last();
+                return true;
+            }
+            if ws.focus_left() {
+                return true;
+            }
+        }
+
+        // Edge of tiling/floating: jump into a visible left sidebar.
+        let has_left = match mon.sidebar_scope() {
+            SidebarScope::Output => mon
+                .left_sidebar
+                .as_ref()
+                .is_some_and(|s| s.is_visible()),
+            SidebarScope::Workspace => mon
+                .active_workspace_ref()
+                .left_sidebar
+                .as_ref()
+                .is_some_and(|s| s.is_visible()),
+        };
+        if has_left {
+            mon.focus_sidebar(SidebarSide::Left);
+            return true;
+        }
+        false
+    }
+
+    /// Returns true if focus moved within the monitor (including into/out of a sidebar).
+    fn focus_right_inner(&mut self) -> bool {
+        let Some(mon) = self.active_monitor() else {
+            if let Some(workspace) = self.active_workspace_mut() {
+                return workspace.focus_right();
+            }
+            return false;
+        };
+
+        if let Some(side) = mon.sidebar_focus {
+            match side {
+                SidebarSide::Right => return true,
+                SidebarSide::Left => {
+                    mon.clear_output_sidebar_focus();
+                    mon.active_workspace().focus_column_first();
+                    return true;
+                }
+            }
+        }
+        {
+            let ws = mon.active_workspace();
+            if ws.right_sidebar.as_ref().is_some_and(|s| s.is_focused()) {
+                return true;
+            }
+            if ws.left_sidebar.as_ref().is_some_and(|s| s.is_focused()) {
+                ws.clear_sidebar_focus();
+                ws.focus_column_first();
+                return true;
+            }
+            if ws.focus_right() {
+                return true;
+            }
+        }
+
+        let has_right = match mon.sidebar_scope() {
+            SidebarScope::Output => mon
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.is_visible()),
+            SidebarScope::Workspace => mon
+                .active_workspace_ref()
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.is_visible()),
+        };
+        if has_right {
+            mon.focus_sidebar(SidebarSide::Right);
+            return true;
+        }
+        false
     }
 
     pub fn focus_column_first(&mut self) {
@@ -1938,6 +2320,9 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.focus_column_first();
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
     }
 
     pub fn focus_column_last(&mut self) {
@@ -1945,6 +2330,9 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.focus_column_last();
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
     }
 
     pub fn focus_column_right_or_first(&mut self) {
@@ -1952,6 +2340,9 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.focus_column_right_or_first();
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
     }
 
     pub fn focus_column_left_or_last(&mut self) {
@@ -1959,6 +2350,9 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.focus_column_left_or_last();
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
     }
 
     pub fn focus_column(&mut self, index: usize) {
@@ -1966,13 +2360,14 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.focus_column(index);
+        if let Some(mon) = self.active_monitor() {
+            mon.update_sidebar_auto_hide();
+        }
     }
 
     pub fn focus_window_up_or_output(&mut self, output: &Output) -> bool {
-        if let Some(workspace) = self.active_workspace_mut() {
-            if workspace.focus_up() {
-                return false;
-            }
+        if self.focus_up() {
+            return false;
         }
 
         self.focus_output(output);
@@ -1980,10 +2375,8 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_window_down_or_output(&mut self, output: &Output) -> bool {
-        if let Some(workspace) = self.active_workspace_mut() {
-            if workspace.focus_down() {
-                return false;
-            }
+        if self.focus_down() {
+            return false;
         }
 
         self.focus_output(output);
@@ -1991,10 +2384,11 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_column_left_or_output(&mut self, output: &Output) -> bool {
-        if let Some(workspace) = self.active_workspace_mut() {
-            if workspace.focus_left() {
-                return false;
+        if self.focus_left_inner() {
+            if let Some(mon) = self.active_monitor() {
+                mon.update_sidebar_auto_hide();
             }
+            return false;
         }
 
         self.focus_output(output);
@@ -2002,10 +2396,11 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_column_right_or_output(&mut self, output: &Output) -> bool {
-        if let Some(workspace) = self.active_workspace_mut() {
-            if workspace.focus_right() {
-                return false;
+        if self.focus_right_inner() {
+            if let Some(mon) = self.active_monitor() {
+                mon.update_sidebar_auto_hide();
             }
+            return false;
         }
 
         self.focus_output(output);
@@ -2019,18 +2414,66 @@ impl<W: LayoutElement> Layout<W> {
         workspace.focus_window_in_column(index);
     }
 
-    pub fn focus_down(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
-            return;
-        };
-        workspace.focus_down();
+    pub fn focus_down(&mut self) -> bool {
+        if let Some(mon) = self.active_monitor() {
+            if let Some(side) = mon.sidebar_focus {
+                match side {
+                    SidebarSide::Left => {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            return sb.focus_down();
+                        }
+                    }
+                    SidebarSide::Right => {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            return sb.focus_down();
+                        }
+                    }
+                }
+            }
+            let ws = mon.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                return sb.focus_down();
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                return sb.focus_down();
+            }
+            return ws.focus_down();
+        }
+        if let Some(workspace) = self.active_workspace_mut() {
+            return workspace.focus_down();
+        }
+        false
     }
 
-    pub fn focus_up(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
-            return;
-        };
-        workspace.focus_up();
+    pub fn focus_up(&mut self) -> bool {
+        if let Some(mon) = self.active_monitor() {
+            if let Some(side) = mon.sidebar_focus {
+                match side {
+                    SidebarSide::Left => {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            return sb.focus_up();
+                        }
+                    }
+                    SidebarSide::Right => {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            return sb.focus_up();
+                        }
+                    }
+                }
+            }
+            let ws = mon.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                return sb.focus_up();
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                return sb.focus_up();
+            }
+            return ws.focus_up();
+        }
+        if let Some(workspace) = self.active_workspace_mut() {
+            return workspace.focus_up();
+        }
+        false
     }
 
     pub fn focus_down_or_left(&mut self) {
@@ -2382,6 +2825,7 @@ impl<W: LayoutElement> Layout<W> {
                     window_id,
                     pointer_delta: _,
                     pointer_ratio_within_window: _,
+                    from_sidebar: _,
                 } => {
                     assert!(
                         self.has_window(window_id),
@@ -2669,26 +3113,50 @@ impl<W: LayoutElement> Layout<W> {
                             let config = is_overview_open
                                 .then_some(self.options.animations.overview_open_close.0);
 
-                            let mon = self.monitor_for_output_mut(&output).unwrap();
+                            match hold.target {
+                                DndHoldTarget::Window(id) => {
+                                    // Handles tiling/floating, workspace-scoped sidebars,
+                                    // output-scoped sidebars, and scratchpad.
+                                    self.activate_window(&id);
+                                    self.focus_output(&output);
 
-                            let ws_idx = match hold.target {
-                                DndHoldTarget::Window(id) => mon
-                                    .workspaces
-                                    .iter_mut()
-                                    .position(|ws| ws.activate_window(&id))
-                                    .unwrap(),
-                                DndHoldTarget::Workspace(id) => {
-                                    mon.workspaces.iter().position(|ws| ws.id() == id).unwrap()
+                                    if let Some(mon) = self.monitor_for_output_mut(&output) {
+                                        mon.dnd_scroll_gesture_end();
+                                        // Only switch workspace when the window lives on one
+                                        // (output sidebars / scratchpad are monitor-scoped).
+                                        if let Some(ws_idx) = mon
+                                            .workspaces
+                                            .iter()
+                                            .position(|ws| ws.has_window(&id))
+                                        {
+                                            mon.activate_workspace_with_anim_config(
+                                                ws_idx, config,
+                                            );
+                                        }
+                                    }
+
+                                    if is_overview_open {
+                                        self.close_overview();
+                                    }
                                 }
-                            };
+                                DndHoldTarget::Workspace(id) => {
+                                    if let Some(mon) = self.monitor_for_output_mut(&output) {
+                                        mon.dnd_scroll_gesture_end();
+                                        if let Some(ws_idx) =
+                                            mon.workspaces.iter().position(|ws| ws.id() == id)
+                                        {
+                                            mon.activate_workspace_with_anim_config(
+                                                ws_idx, config,
+                                            );
+                                        }
+                                    }
 
-                            mon.dnd_scroll_gesture_end();
-                            mon.activate_workspace_with_anim_config(ws_idx, config);
+                                    self.focus_output(&output);
 
-                            self.focus_output(&output);
-
-                            if is_overview_open {
-                                self.close_overview();
+                                    if is_overview_open {
+                                        self.close_overview();
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -2858,44 +3326,65 @@ impl<W: LayoutElement> Layout<W> {
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-            match insert_ws {
-                InsertWorkspace::Existing(ws_id) => {
-                    let ws = mon
-                        .workspaces
-                        .iter_mut()
-                        .find(|ws| ws.id() == ws_id)
-                        .unwrap();
-                    let pos_within_workspace =
-                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                    let position = if move_.is_floating {
-                        InsertPosition::Floating
-                    } else {
-                        ws.scrolling_insert_position(pos_within_workspace)
-                    };
 
-                    let border_width = move_.tile.effective_border_width().unwrap_or(0.);
-                    let corner_radius = move_
-                        .tile
-                        .window()
-                        .geometry_corner_radius()
-                        .expanded_by(border_width as f32);
-                    mon.insert_hint = Some(InsertHint {
-                        workspace: insert_ws,
-                        position,
-                        corner_radius,
-                    });
-                }
-                InsertWorkspace::NewAt(_) => {
-                    let position = if move_.is_floating {
-                        InsertPosition::Floating
-                    } else {
-                        InsertPosition::NewColumn(0)
-                    };
-                    mon.insert_hint = Some(InsertHint {
-                        workspace: insert_ws,
-                        position,
-                        corner_radius: CornerRadius::default(),
-                    });
+            let sidebar_drop = mon
+                .workspace_for_insert(insert_ws)
+                .and_then(|ws| {
+                    mon.sidebar_drop_at(
+                        move_.pointer_pos_within_output,
+                        ws,
+                        move_.from_sidebar,
+                        move_.left_origin_edge,
+                        move_.origin_sidebar_panel_rect,
+                    )
+                });
+
+            if let Some(side) = sidebar_drop {
+                mon.insert_hint = Some(InsertHint {
+                    workspace: insert_ws,
+                    position: InsertPosition::Sidebar(side),
+                    corner_radius: CornerRadius::default(),
+                });
+            } else {
+                match insert_ws {
+                    InsertWorkspace::Existing(ws_id) => {
+                        let ws = mon
+                            .workspaces
+                            .iter_mut()
+                            .find(|ws| ws.id() == ws_id)
+                            .unwrap();
+                        let pos_within_workspace =
+                            (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
+                        let position = if move_.is_floating {
+                            InsertPosition::Floating
+                        } else {
+                            ws.scrolling_insert_position(pos_within_workspace)
+                        };
+
+                        let border_width = move_.tile.effective_border_width().unwrap_or(0.);
+                        let corner_radius = move_
+                            .tile
+                            .window()
+                            .geometry_corner_radius()
+                            .expanded_by(border_width as f32);
+                        mon.insert_hint = Some(InsertHint {
+                            workspace: insert_ws,
+                            position,
+                            corner_radius,
+                        });
+                    }
+                    InsertWorkspace::NewAt(_) => {
+                        let position = if move_.is_floating {
+                            InsertPosition::Floating
+                        } else {
+                            InsertPosition::NewColumn(0)
+                        };
+                        mon.insert_hint = Some(InsertHint {
+                            workspace: insert_ws,
+                            position,
+                            corner_radius: CornerRadius::default(),
+                        });
+                    }
                 }
             }
         }
@@ -2954,7 +3443,15 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        self.update_options(Options::from_config(config));
+        let dms_sidebar_theme = self.options.dms_sidebar_theme.clone();
+        let mut options = Options::from_config(config);
+        options.dms_sidebar_theme = dms_sidebar_theme;
+        self.update_options(options);
+    }
+
+    /// Update the shared DMS sidebar theme cell (no layout rebuild).
+    pub fn set_dms_sidebar_theme(&self, theme: Option<DmsSidebarTheme>) {
+        *self.options.dms_sidebar_theme.borrow_mut() = theme;
     }
 
     fn update_options(&mut self, options: Options) {
@@ -2987,10 +3484,179 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_width(&mut self, forwards: bool) {
+        if let Some(mon) = self.active_monitor() {
+            if let Some(side) = mon.sidebar_focus {
+                let sync = match side {
+                    SidebarSide::Left => {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            sb.toggle_width(forwards);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    SidebarSide::Right => {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            sb.toggle_width(forwards);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if sync {
+                    mon.sync_sidebar_insets();
+                    return;
+                }
+            }
+
+            // Workspace-scoped sidebar focus.
+            let ws = mon.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.toggle_width(forwards);
+                mon.sync_sidebar_insets();
+                return;
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.toggle_width(forwards);
+                mon.sync_sidebar_insets();
+                return;
+            }
+        }
+
         let Some(workspace) = self.active_workspace_mut() else {
             return;
         };
         workspace.toggle_width(forwards);
+    }
+
+    pub fn move_window_to_scratchpad(&mut self, window: Option<&W::Id>) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if window.is_none() || window == Some(move_.tile.window().id()) {
+                let id = move_.tile.window().id().clone();
+                self.interactive_move_end(&id);
+                let mon_idx = self.monitors().position(|m| {
+                    m.has_window(&id) || m.scratchpad.contains(&id)
+                });
+                if let Some(idx) = mon_idx {
+                    if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+                        monitors[idx].move_window_to_scratchpad(Some(&id));
+                    }
+                } else if let Some(mon) = self.active_monitor() {
+                    mon.move_window_to_scratchpad(Some(&id));
+                }
+                return;
+            }
+        }
+
+        if let Some(id) = window {
+            let mon_idx = self.monitors().position(|m| m.has_window(id));
+            if let Some(idx) = mon_idx {
+                if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+                    monitors[idx].move_window_to_scratchpad(Some(id));
+                }
+                return;
+            }
+        }
+        if let Some(mon) = self.active_monitor() {
+            mon.move_window_to_scratchpad(window);
+        }
+    }
+
+    pub fn toggle_scratchpad(&mut self) {
+        if let Some(mon) = self.active_monitor() {
+            mon.toggle_scratchpad();
+        }
+    }
+
+    pub fn cycle_scratchpad(&mut self, forward: bool) {
+        if let Some(mon) = self.active_monitor() {
+            mon.cycle_scratchpad(forward);
+        }
+    }
+
+    pub fn move_window_to_sidebar(&mut self, side: SidebarSide, window: Option<&W::Id>) {
+        if let Some(id) = window {
+            if let Some(mon) = self.monitors_mut().find(|m| m.has_window(id)) {
+                mon.move_window_to_sidebar(side, Some(id));
+                return;
+            }
+        }
+        if let Some(mon) = self.active_monitor() {
+            mon.move_window_to_sidebar(side, window);
+        }
+    }
+
+    pub fn move_window_out_of_sidebar(&mut self, window: Option<&W::Id>) {
+        if let Some(mon) = self.active_monitor() {
+            mon.move_window_out_of_sidebar(window);
+        }
+    }
+
+    pub fn toggle_sidebar(&mut self, side: SidebarSide) {
+        if let Some(mon) = self.active_monitor() {
+            mon.toggle_sidebar(side);
+        }
+    }
+
+    pub fn focus_sidebar(&mut self, side: SidebarSide) {
+        if let Some(mon) = self.active_monitor() {
+            mon.focus_sidebar(side);
+        }
+    }
+
+    pub fn set_sidebar_width(&mut self, change: SizeChange) {
+        if let Some(mon) = self.active_monitor() {
+            if let Some(side) = mon.sidebar_focus {
+                match side {
+                    SidebarSide::Left => {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            sb.set_width(change);
+                        }
+                    }
+                    SidebarSide::Right => {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            sb.set_width(change);
+                        }
+                    }
+                }
+                mon.sync_sidebar_insets();
+                return;
+            }
+            let ws = mon.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.set_width(change);
+                mon.sync_sidebar_insets();
+                return;
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.set_width(change);
+                mon.sync_sidebar_insets();
+            }
+        }
+    }
+
+    /// Whether the given sidebar is logically open and fully revealed (open_progress ≈ 1).
+    pub fn sidebar_fully_visible(&self, output: &Output, side: SidebarSide) -> bool {
+        let Some(mon) = self.monitor_for_output(output) else {
+            return false;
+        };
+        let check = |sb: &crate::layout::sidebar::Sidebar<W>| {
+            sb.is_visible() && sb.open_progress() > 0.99
+        };
+        match mon.sidebar_scope() {
+            SidebarScope::Output => match side {
+                SidebarSide::Left => mon.left_sidebar.as_ref().is_some_and(check),
+                SidebarSide::Right => mon.right_sidebar.as_ref().is_some_and(check),
+            },
+            SidebarScope::Workspace => {
+                let ws = mon.active_workspace_ref();
+                match side {
+                    SidebarSide::Left => ws.left_sidebar.as_ref().is_some_and(check),
+                    SidebarSide::Right => ws.right_sidebar.as_ref().is_some_and(check),
+                }
+            }
+        }
     }
 
     pub fn toggle_window_width(&mut self, window: Option<&W::Id>, forwards: bool) {
@@ -3219,17 +3885,27 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_floating(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        if let Some(mon) = self.active_monitor() {
+            mon.clear_output_sidebar_focus();
+            mon.active_workspace().clear_sidebar_focus();
+            mon.active_workspace().focus_floating();
             return;
-        };
-        workspace.focus_floating();
+        }
+        if let Some(workspace) = self.active_workspace_mut() {
+            workspace.focus_floating();
+        }
     }
 
     pub fn focus_tiling(&mut self) {
-        let Some(workspace) = self.active_workspace_mut() else {
+        if let Some(mon) = self.active_monitor() {
+            mon.clear_output_sidebar_focus();
+            mon.active_workspace().clear_sidebar_focus();
+            mon.active_workspace().focus_tiling();
             return;
-        };
-        workspace.focus_tiling();
+        }
+        if let Some(workspace) = self.active_workspace_mut() {
+            workspace.focus_tiling();
+        }
     }
 
     pub fn switch_focus_floating_tiling(&mut self) {
@@ -3262,6 +3938,17 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         workspace.move_floating_window(id, x, y, animate);
+    }
+
+    /// Pointer delta split into `(main, cross)` for the output's tiling axis.
+    pub fn map_gesture_delta(&self, output: &Output, dx: f64, dy: f64) -> (f64, f64) {
+        axis::AxisMap::new(self.output_main_axis(output)).gesture_components(dx, dy)
+    }
+
+    pub fn output_main_axis(&self, output: &Output) -> niri_config::MainAxis {
+        self.monitor_for_output(output)
+            .map(|mon| mon.active_workspace_ref().main_axis())
+            .unwrap_or_default()
     }
 
     pub fn focus_output(&mut self, output: &Output) {
@@ -3514,6 +4201,13 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        for mon in self.monitors_mut() {
+            if let Some(ws_idx) = mon.workspaces.iter().position(|ws| ws.has_window(id)) {
+                mon.workspaces[ws_idx].set_fullscreen(id, is_fullscreen);
+                mon.update_sidebar_auto_hide();
+                return;
+            }
+        }
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.set_fullscreen(id, is_fullscreen);
@@ -3529,6 +4223,13 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        for mon in self.monitors_mut() {
+            if let Some(ws_idx) = mon.workspaces.iter().position(|ws| ws.has_window(id)) {
+                mon.workspaces[ws_idx].toggle_fullscreen(id);
+                mon.update_sidebar_auto_hide();
+                return;
+            }
+        }
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.toggle_fullscreen(id);
@@ -3564,6 +4265,13 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        for mon in self.monitors_mut() {
+            if let Some(ws_idx) = mon.workspaces.iter().position(|ws| ws.has_window(id)) {
+                mon.workspaces[ws_idx].set_maximized(id, maximize);
+                mon.update_sidebar_auto_hide();
+                return;
+            }
+        }
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.set_maximized(id, maximize);
@@ -3579,6 +4287,13 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        for mon in self.monitors_mut() {
+            if let Some(ws_idx) = mon.workspaces.iter().position(|ws| ws.has_window(id)) {
+                mon.workspaces[ws_idx].toggle_maximized(id);
+                mon.update_sidebar_auto_hide();
+                return;
+            }
+        }
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 ws.toggle_maximized(id);
@@ -3790,6 +4505,24 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
+    /// Physical tile size a dragged column would take on `output` at `pointer`.
+    fn tiled_preview_size(
+        &self,
+        output: &Output,
+        pointer: Point<f64, Logical>,
+        width: ColumnWidth,
+        is_full_width: bool,
+    ) -> Option<Size<f64, Logical>> {
+        let mon = self.monitor_for_output(output)?;
+        let (insert_ws, _) = mon.insert_position(pointer);
+        let ws = match insert_ws {
+            InsertWorkspace::Existing(id) => mon.workspaces.iter().find(|ws| ws.id() == id),
+            InsertWorkspace::NewAt(_) => None,
+        };
+        let ws = ws.unwrap_or_else(|| mon.active_workspace_ref());
+        Some(ws.tiled_size_for_width(width, is_full_width))
+    }
+
     pub fn interactive_move_begin(
         &mut self,
         window_id: W::Id,
@@ -3800,32 +4533,126 @@ impl<W: LayoutElement> Layout<W> {
             return false;
         }
 
-        let Some((mon, (ws, ws_geo))) = self.monitors().find_map(|mon| {
-            mon.workspaces_with_render_geo()
-                .find(|(ws, _)| ws.has_window(&window_id))
-                .map(|rv| (mon, rv))
-        }) else {
+        let Some(mon) = self.monitors().find(|mon| mon.output() == output) else {
             return false;
         };
 
-        if mon.output() != output {
-            return false;
-        }
-
         let zoom = mon.overview_zoom();
 
-        let is_floating = ws.is_floating(&window_id);
-        let (tile, tile_offset, _visible) = ws
-            .tiles_with_render_positions()
-            .find(|(tile, _, _)| tile.window().id() == &window_id)
-            .unwrap();
-        let window_offset = tile.window_loc();
+        // Resolve tile geometry from tiling/floating, workspace sidebars, or output stores.
+        let mut from_sidebar = None;
+        let mut is_floating = false;
+        let mut tile_info = None;
 
-        let tile_pos = ws_geo.loc + tile_offset.upscale(zoom);
+        if let Some((ws, ws_geo)) = mon
+            .workspaces_with_render_geo()
+            .find(|(ws, _)| ws.has_window(&window_id))
+        {
+            is_floating = ws.is_floating(&window_id);
+            if ws.left_sidebar.as_ref().is_some_and(|s| s.contains(&window_id)) {
+                from_sidebar = Some(SidebarSide::Left);
+            } else if ws
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.contains(&window_id))
+            {
+                from_sidebar = Some(SidebarSide::Right);
+            }
+
+            tile_info = ws
+                .tiles_with_render_positions()
+                .find(|(tile, _, _)| tile.window().id() == &window_id)
+                .map(|(tile, offset, _)| {
+                    (
+                        tile.window_loc(),
+                        tile.window_size(),
+                        ws_geo.loc + offset.upscale(zoom),
+                    )
+                })
+                .or_else(|| {
+                    ws.left_sidebar
+                        .as_ref()
+                        .and_then(|s| {
+                            s.tiles_with_positions()
+                                .find(|(tile, _)| tile.window().id() == &window_id)
+                                .map(|(tile, p)| {
+                                    (
+                                        tile.window_loc(),
+                                        tile.window_size(),
+                                        ws_geo.loc + p.upscale(zoom),
+                                    )
+                                })
+                        })
+                        .or_else(|| {
+                            ws.right_sidebar.as_ref().and_then(|s| {
+                                s.tiles_with_positions()
+                                    .find(|(tile, _)| tile.window().id() == &window_id)
+                                    .map(|(tile, p)| {
+                                        (
+                                            tile.window_loc(),
+                                            tile.window_size(),
+                                            ws_geo.loc + p.upscale(zoom),
+                                        )
+                                    })
+                            })
+                        })
+                });
+        } else if mon.left_sidebar.as_ref().is_some_and(|s| s.contains(&window_id))
+            || mon
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.contains(&window_id))
+            || mon.scratchpad.contains(&window_id)
+        {
+            if mon.left_sidebar.as_ref().is_some_and(|s| s.contains(&window_id)) {
+                from_sidebar = Some(SidebarSide::Left);
+            } else if mon
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.contains(&window_id))
+            {
+                from_sidebar = Some(SidebarSide::Right);
+            }
+
+            if let Some(ws_geo) = mon.active_workspace_render_geo() {
+                let offset = mon
+                    .left_sidebar
+                    .as_ref()
+                    .and_then(|s| {
+                        s.tiles_with_positions()
+                            .find(|(tile, _)| tile.window().id() == &window_id)
+                            .map(|(tile, p)| (tile.window_loc(), tile.window_size(), p))
+                    })
+                    .or_else(|| {
+                        mon.right_sidebar.as_ref().and_then(|s| {
+                            s.tiles_with_positions()
+                                .find(|(tile, _)| tile.window().id() == &window_id)
+                                .map(|(tile, p)| (tile.window_loc(), tile.window_size(), p))
+                        })
+                    })
+                    .or_else(|| {
+                        mon.scratchpad.shown_tile_pos().and_then(|(tile, p)| {
+                            (tile.window().id() == &window_id)
+                                .then(|| (tile.window_loc(), tile.window_size(), p))
+                        })
+                    });
+                if let Some((window_loc, window_size, tile_offset)) = offset {
+                    tile_info = Some((
+                        window_loc,
+                        window_size,
+                        ws_geo.loc + tile_offset.upscale(zoom),
+                    ));
+                }
+            }
+        }
+
+        let Some((window_offset, window_size, tile_pos)) = tile_info else {
+            return false;
+        };
 
         let pointer_offset_within_window =
             start_pos_within_output - tile_pos - window_offset.upscale(zoom);
-        let window_size = tile.window_size().upscale(zoom);
+        let window_size = window_size.upscale(zoom);
         let pointer_ratio_within_window = (
             f64::clamp(pointer_offset_within_window.x / window_size.w, 0., 1.),
             f64::clamp(pointer_offset_within_window.y / window_size.h, 0., 1.),
@@ -3835,6 +4662,7 @@ impl<W: LayoutElement> Layout<W> {
             window_id,
             pointer_delta: Point::from((0., 0.)),
             pointer_ratio_within_window,
+            from_sidebar,
         });
 
         for mon in self.monitors_mut() {
@@ -3867,12 +4695,14 @@ impl<W: LayoutElement> Layout<W> {
                 window_id,
                 mut pointer_delta,
                 pointer_ratio_within_window,
+                from_sidebar,
             } => {
                 if window_id != *window {
                     self.interactive_move = Some(InteractiveMoveState::Starting {
                         window_id,
                         pointer_delta,
                         pointer_ratio_within_window,
+                        from_sidebar,
                     });
                     return false;
                 }
@@ -3891,27 +4721,48 @@ impl<W: LayoutElement> Layout<W> {
                 }
                 .band(sq_dist / INTERACTIVE_MOVE_START_THRESHOLD);
 
-                let (is_floating, tile, workspace_config) = self
-                    .workspaces_mut()
-                    .find(|ws| ws.has_window(&window_id))
-                    .map(|ws| {
-                        let workspace_config = ws.layout_config().cloned().map(|c| (ws.id(), c));
-                        (
-                            ws.is_floating(&window_id),
-                            ws.tiles_mut()
-                                .find(|tile| *tile.window().id() == window_id)
-                                .unwrap(),
-                            workspace_config,
-                        )
-                    })
-                    .unwrap();
-                tile.interactive_move_offset = pointer_delta.upscale(factor);
+                // Prefer workspace (incl. workspace-scoped sidebars); fall back to monitor stores.
+                let found_in_ws = self.workspaces_mut().any(|ws| ws.has_window(&window_id));
+                let (is_floating, workspace_config) = if found_in_ws {
+                    let ws = self
+                        .workspaces_mut()
+                        .find(|ws| ws.has_window(&window_id))
+                        .unwrap();
+                    let workspace_config = ws.layout_config().cloned().map(|c| (ws.id(), c));
+                    let is_floating = ws.is_floating(&window_id);
+                    let tile = ws
+                        .tiles_mut()
+                        .find(|tile| *tile.window().id() == window_id)
+                        .unwrap();
+                    tile.interactive_move_offset = pointer_delta.upscale(factor);
+                    (is_floating, workspace_config)
+                } else {
+                    // Output-scoped sidebar or scratchpad.
+                    let mon = self
+                        .monitors_mut()
+                        .find(|m| {
+                            m.scratchpad.contains(&window_id)
+                                || m.left_sidebar.as_ref().is_some_and(|s| s.contains(&window_id))
+                                || m.right_sidebar.as_ref().is_some_and(|s| s.contains(&window_id))
+                        })
+                        .unwrap();
+                    let tile = mon
+                        .scratchpad
+                        .tiles_mut()
+                        .chain(mon.left_sidebar.iter_mut().flat_map(|s| s.tiles_mut()))
+                        .chain(mon.right_sidebar.iter_mut().flat_map(|s| s.tiles_mut()))
+                        .find(|tile| *tile.window().id() == window_id)
+                        .unwrap();
+                    tile.interactive_move_offset = pointer_delta.upscale(factor);
+                    (false, None)
+                };
 
                 // Put it back to be able to easily return.
                 self.interactive_move = Some(InteractiveMoveState::Starting {
                     window_id: window_id.clone(),
                     pointer_delta,
                     pointer_ratio_within_window,
+                    from_sidebar,
                 });
 
                 if !is_floating && sq_dist < INTERACTIVE_MOVE_START_THRESHOLD {
@@ -3931,21 +4782,99 @@ impl<W: LayoutElement> Layout<W> {
                 // FIXME: when and if the layout code knows about monitor positions, this will be
                 // potentially animatable.
                 let mut tile_pos = None;
+                // Workspace (incl. workspace-scoped sidebars).
                 if let Some((mon, (ws, ws_geo))) = self.monitors().find_map(|mon| {
                     mon.workspaces_with_render_geo()
                         .find(|(ws, _)| ws.has_window(window))
                         .map(|rv| (mon, rv))
                 }) {
                     if mon.output() == &output {
-                        let (_, tile_offset, _) = ws
+                        let zoom = mon.overview_zoom();
+                        let tile_offset = ws
                             .tiles_with_render_positions()
                             .find(|(tile, _, _)| tile.window().id() == window)
-                            .unwrap();
-
-                        let zoom = mon.overview_zoom();
-                        tile_pos = Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
+                            .map(|(_, offset, _)| offset)
+                            .or_else(|| {
+                                ws.left_sidebar
+                                    .as_ref()
+                                    .and_then(|s| {
+                                        s.tiles_with_positions()
+                                            .find(|(tile, _)| tile.window().id() == window)
+                                            .map(|(_, p)| p)
+                                    })
+                                    .or_else(|| {
+                                        ws.right_sidebar.as_ref().and_then(|s| {
+                                            s.tiles_with_positions()
+                                                .find(|(tile, _)| tile.window().id() == window)
+                                                .map(|(_, p)| p)
+                                        })
+                                    })
+                            });
+                        if let Some(tile_offset) = tile_offset {
+                            tile_pos = Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
+                        }
                     }
                 }
+                // Output-scoped sidebars (screen-fixed) / shown scratchpad on the target output.
+                if tile_pos.is_none() {
+                    if let Some(mon) = self.monitors().find(|mon| mon.output() == &output) {
+                        let sidebar_offset = mon
+                            .left_sidebar
+                            .as_ref()
+                            .and_then(|s| {
+                                s.tiles_with_positions()
+                                    .find(|(tile, _)| tile.window().id() == window)
+                                    .map(|(_, p)| p)
+                            })
+                            .or_else(|| {
+                                mon.right_sidebar.as_ref().and_then(|s| {
+                                    s.tiles_with_positions()
+                                        .find(|(tile, _)| tile.window().id() == window)
+                                        .map(|(_, p)| p)
+                                })
+                            });
+                        if let Some(tile_offset) = sidebar_offset {
+                            // Output sidebars stay in screen space during overview.
+                            tile_pos = Some((tile_offset, 1.));
+                        } else {
+                            let zoom = mon.overview_zoom();
+                            let ws_geo = mon.active_workspace_render_geo();
+                            if let Some(ws_geo) = ws_geo {
+                                let offset = mon
+                                    .scratchpad
+                                    .shown_tile_pos()
+                                    .filter(|(tile, _)| tile.window().id() == window)
+                                    .map(|(_, p)| p);
+                                if let Some(tile_offset) = offset {
+                                    tile_pos =
+                                        Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Capture origin panel in output space before remove_window may discard it.
+                let origin_sidebar_panel_rect = from_sidebar.and_then(|side| {
+                    let mon = self.monitor_for_output(&output)?;
+                    match mon.sidebar_scope() {
+                        niri_config::SidebarScope::Output => {
+                            let sb = match side {
+                                SidebarSide::Left => mon.left_sidebar.as_ref(),
+                                SidebarSide::Right => mon.right_sidebar.as_ref(),
+                            }?;
+                            (sb.open_progress() > 0.).then(|| sb.panel_rect())
+                        }
+                        niri_config::SidebarScope::Workspace => {
+                            let ws = mon
+                                .workspaces
+                                .iter()
+                                .find(|w| w.has_window(window))
+                                .or_else(|| Some(mon.active_workspace_ref()))?;
+                            mon.open_sidebar_panel_in_output_space(side, ws)
+                        }
+                    }
+                });
 
                 // Clear it before calling remove_window() to avoid running interactive_move_end()
                 // in the middle of interactive_move_update() and the confusion that causes.
@@ -3953,12 +4882,10 @@ impl<W: LayoutElement> Layout<W> {
 
                 // Unset fullscreen before removing the tile. This will restore its size properly,
                 // and move it to floating if needed, so we don't have to deal with that here.
-                let ws = self
-                    .workspaces_mut()
-                    .find(|ws| ws.has_window(&window_id))
-                    .unwrap();
-                ws.set_fullscreen(window, false);
-                ws.set_maximized(window, false);
+                if let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(&window_id)) {
+                    ws.set_fullscreen(window, false);
+                    ws.set_maximized(window, false);
+                }
 
                 let RemovedTile {
                     mut tile,
@@ -3982,6 +4909,16 @@ impl<W: LayoutElement> Layout<W> {
                     .with_merged_layout(workspace_config.as_ref().map(|(_, c)| c))
                     .adjusted_for_scale(scale);
                 tile.update_config(view_size, scale, Rc::new(options));
+                if !is_floating {
+                    if let Some(size) = self.tiled_preview_size(
+                        &output,
+                        pointer_pos_within_output,
+                        width,
+                        is_full_width,
+                    ) {
+                        tile.request_tile_size(size, true, None);
+                    }
+                }
 
                 if is_floating {
                     // Unlock the view in case we locked it moving a fullscreen window that is
@@ -3999,6 +4936,24 @@ impl<W: LayoutElement> Layout<W> {
                     tile.hold_alpha_animation_after_done();
                 }
 
+                let left_origin_edge = if from_sidebar.is_some() {
+                    if let Some(rect) = origin_sidebar_panel_rect {
+                        !rect.contains(pointer_pos_within_output)
+                    } else if let Some(mon) = self.monitor_for_output(&output) {
+                        let (insert_ws, _) = mon.insert_position(pointer_pos_within_output);
+                        let side = from_sidebar.unwrap();
+                        let latch = mon
+                            .workspace_for_insert(insert_ws)
+                            .map(|ws| mon.sidebar_origin_latch_rect(side, ws))
+                            .unwrap_or_else(|| mon.sidebar_edge_strip_rect(side));
+                        !latch.contains(pointer_pos_within_output)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
                 let mut data = InteractiveMoveData {
                     tile,
                     output,
@@ -4009,6 +4964,9 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
+                    from_sidebar,
+                    left_origin_edge,
+                    origin_sidebar_panel_rect,
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -4067,9 +5025,42 @@ impl<W: LayoutElement> Layout<W> {
                         .with_merged_layout(move_.workspace_config.as_ref().map(|(_, c)| c))
                         .adjusted_for_scale(scale);
                     move_.tile.update_config(view_size, scale, Rc::new(options));
+
+                    // Retile the preview to the monitor under the pointer: a column becomes a
+                    // row, and a row becomes a column, before the drag is released.
+                    if !move_.is_floating {
+                        if let Some(size) = self.tiled_preview_size(
+                            &output,
+                            pointer_pos_within_output,
+                            move_.width,
+                            move_.is_full_width,
+                        ) {
+                            move_.tile.request_tile_size(size, true, None);
+                        }
+                    }
                 }
 
                 move_.pointer_pos_within_output = pointer_pos_within_output;
+
+                // Track whether the pointer left the origin sidebar latch zone.
+                if let Some(side) = move_.from_sidebar {
+                    if !move_.left_origin_edge {
+                        let latch = move_.origin_sidebar_panel_rect.or_else(|| {
+                            let mon = self.monitor_for_output(&move_.output)?;
+                            let (insert_ws, _) =
+                                mon.insert_position(move_.pointer_pos_within_output);
+                            Some(
+                                mon.workspace_for_insert(insert_ws)
+                                    .map(|ws| mon.sidebar_origin_latch_rect(side, ws))
+                                    .unwrap_or_else(|| mon.sidebar_edge_strip_rect(side)),
+                            )
+                        });
+                        if latch.is_some_and(|latch| !latch.contains(move_.pointer_pos_within_output))
+                        {
+                            move_.left_origin_edge = true;
+                        }
+                    }
+                }
 
                 self.interactive_move = Some(InteractiveMoveState::Moving(move_));
             }
@@ -4119,6 +5110,22 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
+                // Also clear rubberband offset on output-scoped sidebar / scratchpad tiles.
+                for mon in self.monitors_mut() {
+                    for tile in mon
+                        .scratchpad
+                        .tiles_mut()
+                        .chain(mon.left_sidebar.iter_mut().flat_map(|s| s.tiles_mut()))
+                        .chain(mon.right_sidebar.iter_mut().flat_map(|s| s.tiles_mut()))
+                    {
+                        if *tile.window().id() == window_id {
+                            let offset = tile.interactive_move_offset;
+                            tile.interactive_move_offset = Point::from((0., 0.));
+                            tile.animate_move_from(offset);
+                        }
+                    }
+                }
+
                 return;
             }
             InteractiveMoveState::Moving(move_) => move_,
@@ -4164,33 +5171,53 @@ impl<W: LayoutElement> Layout<W> {
                         let zoom = mon.overview_zoom();
 
                         let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-                        let (position, offset) = match insert_ws {
-                            InsertWorkspace::Existing(ws_id) => {
-                                let ws_idx = mon
-                                    .workspaces
-                                    .iter_mut()
-                                    .position(|ws| ws.id() == ws_id)
-                                    .unwrap();
 
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    let pos_within_workspace =
-                                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                                    let ws = &mut mon.workspaces[ws_idx];
-                                    ws.scrolling_insert_position(pos_within_workspace)
-                                };
+                        // Sidebar panel / edge-drop zones take priority over column insert.
+                        let sidebar_drop = mon
+                            .workspace_for_insert(insert_ws)
+                            .and_then(|ws| {
+                                mon.sidebar_drop_at(
+                                    move_.pointer_pos_within_output,
+                                    ws,
+                                    move_.from_sidebar,
+                                    move_.left_origin_edge,
+                                    move_.origin_sidebar_panel_rect,
+                                )
+                            });
 
-                                (position, Some(geo.loc))
-                            }
-                            InsertWorkspace::NewAt(_) => {
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    InsertPosition::NewColumn(0)
-                                };
+                        let (position, offset) = if let Some(side) = sidebar_drop {
+                            (InsertPosition::Sidebar(side), Some(geo.loc))
+                        } else {
+                            match insert_ws {
+                                InsertWorkspace::Existing(ws_id) => {
+                                    let ws_idx = mon
+                                        .workspaces
+                                        .iter_mut()
+                                        .position(|ws| ws.id() == ws_id)
+                                        .unwrap();
 
-                                (position, None)
+                                    let position = if move_.is_floating {
+                                        InsertPosition::Floating
+                                    } else {
+                                        let pos_within_workspace = (move_
+                                            .pointer_pos_within_output
+                                            - geo.loc)
+                                            .downscale(zoom);
+                                        let ws = &mut mon.workspaces[ws_idx];
+                                        ws.scrolling_insert_position(pos_within_workspace)
+                                    };
+
+                                    (position, Some(geo.loc))
+                                }
+                                InsertWorkspace::NewAt(_) => {
+                                    let position = if move_.is_floating {
+                                        InsertPosition::Floating
+                                    } else {
+                                        InsertPosition::NewColumn(0)
+                                    };
+
+                                    (position, None)
+                                }
                             }
                         };
 
@@ -4214,6 +5241,7 @@ impl<W: LayoutElement> Layout<W> {
 
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
+                let dropped_to_sidebar = matches!(position, InsertPosition::Sidebar(_));
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon
@@ -4307,6 +5335,34 @@ impl<W: LayoutElement> Layout<W> {
                             true,
                         );
                     }
+                    InsertPosition::Sidebar(side) => {
+                        let removed = RemovedTile {
+                            tile: move_.tile,
+                            width: move_.width,
+                            is_full_width: move_.is_full_width,
+                            is_floating: false,
+                        };
+                        let output = mon.output.clone();
+                        match mon.sidebar_scope() {
+                            niri_config::SidebarScope::Output => {
+                                let sb = mon.ensure_output_sidebar(side);
+                                sb.push(removed);
+                                sb.update_output(&output);
+                            }
+                            niri_config::SidebarScope::Workspace => {
+                                let sb = mon.active_workspace().ensure_sidebar(side);
+                                sb.push(removed);
+                                sb.update_output(&output);
+                            }
+                        }
+                        mon.sync_sidebar_insets();
+                        mon.focus_sidebar(side);
+                    }
+                }
+
+                // Sidebar drops are done; skip workspace tile animation lookup.
+                if dropped_to_sidebar {
+                    return;
                 }
 
                 // needed because empty_workspace_above_first could have modified the idx
@@ -4392,7 +5448,29 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    // Resizing a sidebar window on its inner edge adjusts sidebar width.
+                    if mon.left_sidebar.as_ref().is_some_and(|s| s.contains(&window))
+                        && (edges.contains(ResizeEdge::RIGHT) || edges.contains(ResizeEdge::LEFT))
+                    {
+                        return true;
+                    }
+                    if mon
+                        .right_sidebar
+                        .as_ref()
+                        .is_some_and(|s| s.contains(&window))
+                        && (edges.contains(ResizeEdge::RIGHT) || edges.contains(ResizeEdge::LEFT))
+                    {
+                        return true;
+                    }
                     for ws in &mut mon.workspaces {
+                        if ws.left_sidebar.as_ref().is_some_and(|s| s.contains(&window))
+                            || ws.right_sidebar.as_ref().is_some_and(|s| s.contains(&window))
+                        {
+                            if edges.contains(ResizeEdge::RIGHT) || edges.contains(ResizeEdge::LEFT)
+                            {
+                                return true;
+                            }
+                        }
                         if ws.has_window(&window) {
                             return ws.interactive_resize_begin(window, edges);
                         }
@@ -4425,7 +5503,39 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    if mon.left_sidebar.as_ref().is_some_and(|s| s.contains(window)) {
+                        if let Some(sb) = &mut mon.left_sidebar {
+                            sb.resize_by_edges(ResizeEdge::RIGHT, delta);
+                        }
+                        mon.sync_sidebar_insets();
+                        return true;
+                    }
+                    if mon
+                        .right_sidebar
+                        .as_ref()
+                        .is_some_and(|s| s.contains(window))
+                    {
+                        if let Some(sb) = &mut mon.right_sidebar {
+                            sb.resize_by_edges(ResizeEdge::LEFT, delta);
+                        }
+                        mon.sync_sidebar_insets();
+                        return true;
+                    }
                     for ws in &mut mon.workspaces {
+                        if ws.left_sidebar.as_ref().is_some_and(|s| s.contains(window)) {
+                            if let Some(sb) = ws.left_sidebar.as_mut() {
+                                sb.resize_by_edges(ResizeEdge::RIGHT, delta);
+                            }
+                            mon.sync_sidebar_insets();
+                            return true;
+                        }
+                        if ws.right_sidebar.as_ref().is_some_and(|s| s.contains(window)) {
+                            if let Some(sb) = ws.right_sidebar.as_mut() {
+                                sb.resize_by_edges(ResizeEdge::LEFT, delta);
+                            }
+                            mon.sync_sidebar_insets();
+                            return true;
+                        }
                         if ws.has_window(window) {
                             return ws.interactive_resize_update(window, delta);
                         }
@@ -4643,6 +5753,21 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+            for mon in monitors {
+                if let Some(sb) = &mut mon.left_sidebar {
+                    if sb.start_open_animation(window) {
+                        return;
+                    }
+                }
+                if let Some(sb) = &mut mon.right_sidebar {
+                    if sb.start_open_animation(window) {
+                        return;
+                    }
+                }
+            }
+        }
+
         for ws in self.workspaces_mut() {
             if ws.start_open_animation(window) {
                 return;
@@ -4684,6 +5809,39 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    let active_geo = mon.active_workspace_render_geo();
+                    if let Some(geo) = active_geo {
+                        let xray_pos = XrayPos::new(geo.loc, zoom);
+                        if mon
+                            .left_sidebar
+                            .as_ref()
+                            .is_some_and(|s| s.contains(window))
+                        {
+                            mon.left_sidebar.as_mut().unwrap().store_unmap_snapshot_if_empty(
+                                renderer,
+                                xray,
+                                xray_has_blocked_out_layers,
+                                xray_pos,
+                                window,
+                            );
+                            return;
+                        }
+                        if mon
+                            .right_sidebar
+                            .as_ref()
+                            .is_some_and(|s| s.contains(window))
+                        {
+                            mon.right_sidebar.as_mut().unwrap().store_unmap_snapshot_if_empty(
+                                renderer,
+                                xray,
+                                xray_has_blocked_out_layers,
+                                xray_pos,
+                                window,
+                            );
+                            return;
+                        }
+                    }
+
                     for (ws, geo) in mon.workspaces_with_render_geo_mut(false) {
                         if ws.has_window(window) {
                             ws.store_unmap_snapshot_if_empty(
@@ -4726,6 +5884,18 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    if let Some(sb) = &mut mon.left_sidebar {
+                        if let Some(tile) = sb.tiles_mut().find(|t| t.window().id() == window) {
+                            let _ = tile.take_unmap_snapshot();
+                            return;
+                        }
+                    }
+                    if let Some(sb) = &mut mon.right_sidebar {
+                        if let Some(tile) = sb.tiles_mut().find(|t| t.window().id() == window) {
+                            let _ = tile.take_unmap_snapshot();
+                            return;
+                        }
+                    }
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
                             ws.clear_unmap_snapshot(window);
@@ -4787,6 +5957,26 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    if mon
+                        .left_sidebar
+                        .as_ref()
+                        .is_some_and(|s| s.contains(window))
+                    {
+                        mon.left_sidebar.as_mut().unwrap().start_close_animation_for_window(
+                            renderer, window, blocker,
+                        );
+                        return;
+                    }
+                    if mon
+                        .right_sidebar
+                        .as_ref()
+                        .is_some_and(|s| s.contains(window))
+                    {
+                        mon.right_sidebar.as_mut().unwrap().start_close_animation_for_window(
+                            renderer, window, blocker,
+                        );
+                        return;
+                    }
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
                             ws.start_close_animation_for_window(renderer, window, blocker);
@@ -4866,11 +6056,15 @@ impl<W: LayoutElement> Layout<W> {
             &self.interactive_move
         {
             ongoing_scrolling_dnd.get_or_insert_with(|| {
-                let (_, _, ws) = self
+                if let Some((_, _, ws)) = self
                     .workspaces()
                     .find(|(_, _, ws)| ws.has_window(window_id))
-                    .unwrap();
-                !ws.is_floating(window_id)
+                {
+                    !ws.is_floating(window_id)
+                } else {
+                    // Output-scoped sidebar / scratchpad: treat as tiled for DnD scroll lock.
+                    true
+                }
             });
         }
 
@@ -4896,6 +6090,13 @@ impl<W: LayoutElement> Layout<W> {
                         let is_focused = is_active && ws_idx == mon.active_workspace_idx;
                         ws.refresh(is_active, is_focused);
 
+                        if let Some(sb) = &mut ws.left_sidebar {
+                            sb.refresh(is_focused);
+                        }
+                        if let Some(sb) = &mut ws.right_sidebar {
+                            sb.refresh(is_focused);
+                        }
+
                         if let Some(is_scrolling) = ongoing_scrolling_dnd {
                             // Lock or unlock the view for scrolling interactive move.
                             if is_scrolling {
@@ -4909,6 +6110,14 @@ impl<W: LayoutElement> Layout<W> {
                                 ws.view_offset_gesture_end(None);
                             }
                         }
+                    }
+
+                    mon.scratchpad.refresh(is_active);
+                    if let Some(sb) = &mut mon.left_sidebar {
+                        sb.refresh(is_active && mon.sidebar_focus == Some(SidebarSide::Left));
+                    }
+                    if let Some(sb) = &mut mon.right_sidebar {
+                        sb.refresh(is_active && mon.sidebar_focus == Some(SidebarSide::Right));
                     }
                 }
             }
@@ -4993,7 +6202,18 @@ impl<W: LayoutElement> Layout<W> {
             .workspaces()
             .flat_map(|(mon, _, ws)| ws.windows().map(move |win| (mon, win)));
 
-        moving_window.chain(rest)
+        let scratch_and_output_sidebars = self.monitors().flat_map(|mon| {
+            mon.scratchpad
+                .windows()
+                .chain(mon.left_sidebar.iter().flat_map(|s| s.windows()))
+                .chain(mon.right_sidebar.iter().flat_map(|s| s.windows()))
+                .map(move |win| (Some(mon), win))
+        });
+
+        // Workspace windows already include workspace-scoped sidebar windows via Workspace::windows.
+        // Output-scoped sidebars and scratchpad are only on Monitor.
+        // Avoid double-counting workspace windows that are also listed via monitor.windows().
+        moving_window.chain(rest).chain(scratch_and_output_sidebars)
     }
 
     pub fn has_window(&self, window: &W::Id) -> bool {

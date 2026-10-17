@@ -4,6 +4,7 @@ use niri_ipc::{ColumnDisplay, SizeChange};
 use crate::appearance::{
     Border, FocusRing, InsertHint, Shadow, TabIndicator, DEFAULT_BACKGROUND_COLOR,
 };
+use crate::sidebar::{Sidebar, SidebarPart};
 use crate::utils::{expect_only_children, Flag, MergeWith};
 use crate::{BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndicatorPart};
 
@@ -14,16 +15,19 @@ pub struct Layout {
     pub shadow: Shadow,
     pub tab_indicator: TabIndicator,
     pub insert_hint: InsertHint,
+    pub main_axis: MainAxis,
     pub preset_column_widths: Vec<PresetSize>,
     pub default_column_width: Option<PresetSize>,
     pub preset_window_heights: Vec<PresetSize>,
     pub center_focused_column: CenterFocusedColumn,
+    pub center_visible_columns: CenterVisibleColumns,
     pub always_center_single_column: bool,
     pub empty_workspace_above_first: bool,
     pub default_column_display: ColumnDisplay,
     pub gaps: f64,
     pub struts: Struts,
     pub background_color: Color,
+    pub sidebar: Sidebar,
 }
 
 impl Default for Layout {
@@ -34,6 +38,7 @@ impl Default for Layout {
             shadow: Shadow::default(),
             tab_indicator: TabIndicator::default(),
             insert_hint: InsertHint::default(),
+            main_axis: MainAxis::Horizontal,
             preset_column_widths: vec![
                 PresetSize::Proportion(1. / 3.),
                 PresetSize::Proportion(0.5),
@@ -41,6 +46,7 @@ impl Default for Layout {
             ],
             default_column_width: Some(PresetSize::Proportion(0.5)),
             center_focused_column: CenterFocusedColumn::Never,
+            center_visible_columns: CenterVisibleColumns::Never,
             always_center_single_column: false,
             empty_workspace_above_first: false,
             default_column_display: ColumnDisplay::Normal,
@@ -52,6 +58,7 @@ impl Default for Layout {
                 PresetSize::Proportion(2. / 3.),
             ],
             background_color: DEFAULT_BACKGROUND_COLOR,
+            sidebar: Sidebar::default(),
         }
     }
 }
@@ -68,13 +75,16 @@ impl MergeWith<LayoutPart> for Layout {
             always_center_single_column,
             empty_workspace_above_first,
             gaps,
+            sidebar,
         );
 
         merge_clone!(
             (self, part),
+            main_axis,
             preset_column_widths,
             preset_window_heights,
             center_focused_column,
+            center_visible_columns,
             default_column_display,
             struts,
             background_color,
@@ -106,6 +116,8 @@ pub struct LayoutPart {
     pub tab_indicator: Option<TabIndicatorPart>,
     #[knuffel(child)]
     pub insert_hint: Option<InsertHintPart>,
+    #[knuffel(child, unwrap(argument))]
+    pub main_axis: Option<MainAxis>,
     #[knuffel(child, unwrap(children))]
     pub preset_column_widths: Option<Vec<PresetSize>>,
     #[knuffel(child)]
@@ -114,6 +126,8 @@ pub struct LayoutPart {
     pub preset_window_heights: Option<Vec<PresetSize>>,
     #[knuffel(child, unwrap(argument))]
     pub center_focused_column: Option<CenterFocusedColumn>,
+    #[knuffel(child, unwrap(argument))]
+    pub center_visible_columns: Option<CenterVisibleColumns>,
     #[knuffel(child)]
     pub always_center_single_column: Option<Flag>,
     #[knuffel(child)]
@@ -126,6 +140,8 @@ pub struct LayoutPart {
     pub struts: Option<Struts>,
     #[knuffel(child)]
     pub background_color: Option<Color>,
+    #[knuffel(child)]
+    pub sidebar: Option<SidebarPart>,
 }
 
 #[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
@@ -158,6 +174,16 @@ pub struct Struts {
     pub bottom: FloatOrInt<-65535, 65535>,
 }
 
+/// Scrolling direction of the tiling strip.
+///
+/// `"horizontal"` lays windows out as columns. `"vertical"` lays them out as rows.
+#[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum MainAxis {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 #[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub enum CenterFocusedColumn {
     /// Focusing a column will not center the column.
@@ -168,6 +194,15 @@ pub enum CenterFocusedColumn {
     /// Focusing a column will center it if it doesn't fit on the screen together with the
     /// previously focused column.
     OnOverflow,
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum CenterVisibleColumns {
+    /// Do not automatically center the column group.
+    #[default]
+    Never,
+    /// Whenever all columns fit in the working area, center the whole group.
+    Always,
 }
 
 impl<S> knuffel::Decode<S> for DefaultPresetSize

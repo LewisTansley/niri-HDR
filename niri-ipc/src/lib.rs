@@ -914,6 +914,66 @@ pub enum Action {
     OpenOverview {},
     /// Close the Overview.
     CloseOverview {},
+    /// Move the focused window to the scratchpad.
+    MoveWindowToScratchpad {
+        /// Id of the window to move.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Toggle the most recently scratched window as an overlay.
+    ToggleScratchpad {},
+    /// Cycle which scratchpad window is current (and show it if one was shown).
+    CycleScratchpad {},
+    /// Cycle scratchpad windows backwards.
+    CycleScratchpadBack {},
+    /// Move the focused window to the left sidebar.
+    MoveWindowToSidebarLeft {
+        /// Id of the window to move.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Move the focused window to the right sidebar.
+    MoveWindowToSidebarRight {
+        /// Id of the window to move.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Move a sidebar window back into the tiling layout.
+    MoveWindowOutOfSidebar {
+        /// Id of the window to move.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Toggle visibility of the left sidebar.
+    ToggleSidebarLeft {},
+    /// Toggle visibility of the right sidebar.
+    ToggleSidebarRight {},
+    /// Focus the left sidebar.
+    FocusSidebarLeft {},
+    /// Focus the right sidebar.
+    FocusSidebarRight {},
+    /// Set the width of the focused sidebar.
+    SetSidebarWidth {
+        /// How to change the width.
+        #[cfg_attr(feature = "clap", arg())]
+        change: SizeChange,
+    },
+    /// Toggle the left sidebar shortcuts dock.
+    ToggleSidebarShortcutsLeft {},
+    /// Toggle the right sidebar shortcuts dock.
+    ToggleSidebarShortcutsRight {},
+    /// Pin the focused window as a left sidebar shortcut.
+    PinWindowToSidebarShortcutsLeft {},
+    /// Pin the focused window as a right sidebar shortcut.
+    PinWindowToSidebarShortcutsRight {},
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

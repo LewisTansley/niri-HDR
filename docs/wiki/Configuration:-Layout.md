@@ -7,7 +7,9 @@ Here are the contents of this section at a glance:
 ```kdl
 layout {
     gaps 16
+    main-axis "horizontal"
     center-focused-column "never"
+    center-visible-columns "never"
     always-center-single-column
     empty-workspace-above-first
     default-column-display "tabbed"
@@ -115,6 +117,38 @@ layout {
 }
 ```
 
+### `main-axis`
+
+Sets the scrolling direction of the tiling strip.
+
+- `"horizontal"` (the default): windows open as columns from left to right, and the view scrolls horizontally.
+- `"vertical"`: windows open as rows from top to bottom, and the view scrolls vertically.
+
+`column width` settings and actions set the size along this strip. `window height` settings set the size across it. On a vertical layout, `default-column-width { proportion 0.5; }` is the row height, and two such rows fit on screen.
+
+Window content stays upright. This is separate from an output's `transform`. Struts, tab-indicator positions, floating windows, and sidebars keep their physical screen directions. Focus and move shortcuts also keep screen directions: `focus-window-down` selects the next row, and `focus-column-right` selects the next window within a row.
+
+Set it on one output to mix a landscape monitor with a portrait monitor:
+
+```kdl
+output "DP-2" {
+    transform "90"
+
+    layout {
+        main-axis "vertical"
+        default-column-width { proportion 0.5; }
+    }
+}
+```
+
+Dragging or moving a window onto that output turns its column into a row. Moving it back turns the row into a column. A named workspace can set `main-axis` too; that override follows the workspace.
+
+```kdl
+layout {
+    main-axis "horizontal"
+}
+```
+
 ### `center-focused-column`
 
 When to center a column when changing focus.
@@ -139,6 +173,22 @@ If set, niri will always center a single column on a workspace, regardless of th
 ```kdl
 layout {
     always-center-single-column
+}
+```
+
+### `center-visible-columns`
+
+When to automatically center all columns as a group whenever they fit in the working area.
+This can be set to:
+
+- `"never"`: no automatic group centering. This is the default. You can still center the currently fully visible columns with the `center-visible-columns` bind.
+- `"always"`: whenever every column on the workspace fits on screen, niri centers the whole group with equal empty space on both sides (similar to CSS `justify-content: center`). If the columns do not all fit, niri falls back to the normal `center-focused-column` scrolling behavior.
+
+`center-focused-column "always"` and `always-center-single-column` take precedence over this option (they center the focused column alone).
+
+```kdl
+layout {
+    center-visible-columns "always"
 }
 ```
 
@@ -178,6 +228,8 @@ layout {
 
 Set the widths that the `switch-preset-column-width` action (Mod+R) toggles between.
 <sup>Since: 25.08</sup> You can use the `switch-preset-column-width-back` action (Mod+Shift+R) to toggle in reverse.
+
+If [`layout.sidebar.column-width-pairs`](./Sidebars.md#linked-openclosed-column-widths) is set, Mod+R on the tiling strip cycles those pairs instead of this list.
 
 `proportion` sets the width as a fraction of the output width, taking gaps into account.
 For example, you can perfectly fit four windows sized `proportion 0.25` on an output, regardless of the gaps setting.
@@ -501,6 +553,35 @@ layout {
     }
 }
 ```
+
+### `sidebar`
+
+Configure [sidebars](./Sidebars.md): left/right stacks of windows that can overlay the tiling strip or reserve space from it.
+
+```kdl
+layout {
+    sidebar {
+        scope "output" // or "workspace"
+        mode "reserve" // or "overlay"
+        preset-widths {
+            proportion 0.2
+            proportion 0.3
+            proportion 0.4
+        }
+        // left { mode "overlay" }
+        // right { mode "reserve" }
+        // hide-when-maximized
+        // hide-when-fullscreen
+    }
+}
+```
+
+- `scope "output"`: sidebars stick to the monitor across workspace switches (default). In the overview they stay fixed at full size instead of zooming out with workspace cards.
+- `scope "workspace"`: each workspace has its own sidebars (they zoom with their cards in the overview).
+- `mode "reserve"`: visible sidebars shrink the tiling/floating working area (default).
+- `mode "overlay"`: sidebars draw above the strip without shrinking it.
+- `preset-widths`: widths cycled by `switch-preset-column-width` while a sidebar is focused.
+- `hide-when-maximized` / `hide-when-fullscreen`: auto-hide sidebars when the active column is maximize-to-edges or fullscreen (see [Sidebars](./Sidebars.md#hide-when-maximized-or-fullscreen)).
 
 ### `struts`
 

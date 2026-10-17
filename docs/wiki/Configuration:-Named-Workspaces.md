@@ -95,3 +95,5 @@ workspace "uncentered" {
     }
 }
 ```
+
+Enum options like `center-visible-columns` can be overridden the same way, e.g. `center-visible-columns "never"`.

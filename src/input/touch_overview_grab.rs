@@ -191,7 +191,8 @@ impl TouchGrab<State> for TouchOverviewGrab {
 
             // Check if the gesture moved far enough to decide. Threshold copied from libadwaita.
             if c.x * c.x + c.y * c.y >= 16. * 16. {
-                if let Some(ws_id) = self.workspace_id.filter(|_| c.x.abs() > c.y.abs()) {
+                let (main, cross) = layout.map_gesture_delta(&self.output, c.x, c.y);
+                if let Some(ws_id) = self.workspace_id.filter(|_| main.abs() > cross.abs()) {
                     if let Some((ws_idx, ws)) = layout.find_workspace_by_id(ws_id) {
                         if ws.current_output() == Some(&self.output) {
                             layout.view_offset_gesture_begin(&self.output, Some(ws_idx), false);
@@ -215,13 +216,14 @@ impl TouchGrab<State> for TouchOverviewGrab {
         let delta = event.location - self.last_location;
         self.last_location = event.location;
 
+        let (main, cross) = layout.map_gesture_delta(&self.output, delta.x, delta.y);
         let ongoing = match self.gesture {
             GestureState::Recognizing => unreachable!(),
             GestureState::ViewOffset => layout
-                .view_offset_gesture_update(-delta.x, timestamp, false)
+                .view_offset_gesture_update(-main, timestamp, false)
                 .is_some(),
             GestureState::WorkspaceSwitch => layout
-                .workspace_switch_gesture_update(-delta.y, timestamp, false)
+                .workspace_switch_gesture_update(-cross, timestamp, false)
                 .is_some(),
             GestureState::InteractiveMove => {
                 let window = self.window.as_ref().unwrap();

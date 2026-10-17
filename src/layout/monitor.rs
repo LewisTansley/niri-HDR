@@ -3,7 +3,9 @@ use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{CornerRadius, LayoutPart};
+use niri_config::{
+    CornerRadius, LayoutPart, PresetSize, SidebarMode, SidebarScope, SidebarSide,
+};
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
@@ -11,13 +13,16 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
+use super::scratchpad::Scratchpad;
 use super::scrolling::{Column, ColumnWidth};
-use super::tile::Tile;
+use super::sidebar::{Sidebar, SidebarRenderElement};
+use super::tile::{Tile, TileRenderElement};
 use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
     WorkspaceRenderElement,
 };
-use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
+use super::axis::AxisMap;
+use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
@@ -75,7 +80,7 @@ pub struct Monitor<W: LayoutElement> {
     /// Insert hint element for rendering.
     insert_hint_element: InsertHintElement,
     /// Location to render the insert hint element.
-    insert_hint_render_loc: Option<InsertHintRenderLoc>,
+    pub(super) insert_hint_render_loc: Option<InsertHintRenderLoc>,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -88,6 +93,18 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) options: Rc<Options>,
     /// Layout config overrides for this monitor.
     layout_config: Option<niri_config::LayoutPart>,
+
+    /// Per-monitor scratchpad.
+    pub(super) scratchpad: Scratchpad<W>,
+
+    /// Output-scoped left sidebar (when `layout.sidebar.scope = "output"`).
+    pub(super) left_sidebar: Option<Sidebar<W>>,
+
+    /// Output-scoped right sidebar.
+    pub(super) right_sidebar: Option<Sidebar<W>>,
+
+    /// Whether an output-scoped sidebar currently holds keyboard focus.
+    pub(super) sidebar_focus: Option<SidebarSide>,
 }
 
 #[derive(Debug)]
@@ -131,6 +148,7 @@ pub(super) enum InsertPosition {
     NewColumn(usize),
     InColumn(usize, usize),
     Floating,
+    Sidebar(SidebarSide),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +165,14 @@ pub(super) struct InsertHint {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct InsertHintRenderLoc {
-    workspace: InsertWorkspace,
-    location: Point<f64, Logical>,
+pub(super) struct InsertHintRenderLoc {
+    pub workspace: InsertWorkspace,
+    pub location: Point<f64, Logical>,
+    /// Stored for layout tests asserting sidebar drop overlay geometry.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub size: Size<f64, Logical>,
+    /// Output-scoped sidebar drop zone: render in screen space (not zoomed with cards).
+    pub fixed_to_output: bool,
 }
 
 #[derive(Debug)]
@@ -190,6 +213,9 @@ niri_render_elements! {
         UncroppedInsertHint = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
+        Tile = CropRenderElement<TileRenderElement<R>>,
+        UncroppedTile = TileRenderElement<R>,
+        Sidebar = CropRenderElement<SidebarRenderElement<R>>,
     }
 }
 
@@ -327,6 +353,13 @@ impl<W: LayoutElement> Monitor<W> {
         let ws = Workspace::new(output.clone(), clock.clone(), options.clone());
         workspaces.push(ws);
 
+        let scratchpad = Scratchpad::new(
+            view_size,
+            working_area,
+            scale.fractional_scale(),
+            options.clone(),
+        );
+
         Self {
             output_name: output.name(),
             output,
@@ -346,10 +379,53 @@ impl<W: LayoutElement> Monitor<W> {
             base_options,
             options,
             layout_config,
+            scratchpad,
+            left_sidebar: None,
+            right_sidebar: None,
+            sidebar_focus: None,
         }
     }
 
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
+        // Move remaining sidebar/scratchpad windows onto the active workspace as floating so they
+        // are not lost when the monitor is torn down.
+        let active_idx = self.active_workspace_idx.min(self.workspaces.len().saturating_sub(1));
+        while let Some(id) = self.scratchpad.mru_id().cloned() {
+            if let Some(removed) = self.scratchpad.remove(&id) {
+                if let Some(ws) = self.workspaces.get_mut(active_idx) {
+                    ws.add_tile(
+                        removed.tile,
+                        WorkspaceAddWindowTarget::Auto,
+                        ActivateWindow::No,
+                        removed.width,
+                        removed.is_full_width,
+                        true,
+                    );
+                }
+            } else {
+                break;
+            }
+        }
+        for side in [SidebarSide::Left, SidebarSide::Right] {
+            if let Some(mut sb) = match side {
+                SidebarSide::Left => self.left_sidebar.take(),
+                SidebarSide::Right => self.right_sidebar.take(),
+            } {
+                for removed in sb.take_all() {
+                    if let Some(ws) = self.workspaces.get_mut(active_idx) {
+                        ws.add_tile(
+                            removed.tile,
+                            WorkspaceAddWindowTarget::Auto,
+                            ActivateWindow::No,
+                            removed.width,
+                            removed.is_full_width,
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+
         self.workspaces.retain(|ws| ws.has_windows_or_name());
 
         for ws in &mut self.workspaces {
@@ -396,11 +472,415 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn windows(&self) -> impl Iterator<Item = &W> {
-        self.workspaces.iter().flat_map(|ws| ws.windows())
+        self.workspaces
+            .iter()
+            .flat_map(|ws| ws.windows())
+            .chain(self.scratchpad.windows())
+            .chain(self.left_sidebar.iter().flat_map(|s| s.windows()))
+            .chain(self.right_sidebar.iter().flat_map(|s| s.windows()))
     }
 
     pub fn has_window(&self, window: &W::Id) -> bool {
         self.windows().any(|win| win.id() == window)
+    }
+
+    pub fn sidebar_scope(&self) -> SidebarScope {
+        self.options.layout.sidebar.scope
+    }
+
+    pub fn sidebar_mode_for(&self, side: SidebarSide) -> SidebarMode {
+        let cfg = &self.options.layout.sidebar;
+        match side {
+            SidebarSide::Left => cfg.left.mode.unwrap_or(cfg.mode),
+            SidebarSide::Right => cfg.right.mode.unwrap_or(cfg.mode),
+        }
+    }
+
+    pub fn output_sidebar_mut(&mut self, side: SidebarSide) -> &mut Option<Sidebar<W>> {
+        match side {
+            SidebarSide::Left => &mut self.left_sidebar,
+            SidebarSide::Right => &mut self.right_sidebar,
+        }
+    }
+
+    pub fn ensure_output_sidebar(&mut self, side: SidebarSide) -> &mut Sidebar<W> {
+        let mode = self.sidebar_mode_for(side);
+        let view_size = self.view_size;
+        let working_area = self.working_area;
+        let scale = self.scale.fractional_scale();
+        let options = self.options.clone();
+        let clock = self.clock.clone();
+        let slot = self.output_sidebar_mut(side);
+        if slot.is_none() {
+            *slot = Some(Sidebar::new(
+                side,
+                mode,
+                view_size,
+                working_area,
+                scale,
+                clock,
+                options,
+            ));
+        }
+        slot.as_mut().unwrap()
+    }
+
+    /// Hide or restore sidebars based on `hide-when-maximized` / `hide-when-fullscreen`.
+    pub fn update_sidebar_auto_hide(&mut self) {
+        let hide_when_maximized = self.options.layout.sidebar.hide_when_maximized;
+        let hide_when_fullscreen = self.options.layout.sidebar.hide_when_fullscreen;
+        let should_hide = if hide_when_maximized || hide_when_fullscreen {
+            let mode = self.active_workspace_ref().active_pending_sizing_mode();
+            (hide_when_maximized && mode.is_maximized())
+                || (hide_when_fullscreen && mode.is_fullscreen())
+        } else {
+            false
+        };
+
+        let mut changed = false;
+        match self.sidebar_scope() {
+            SidebarScope::Output => {
+                if let Some(sb) = &mut self.left_sidebar {
+                    changed |= sb.apply_auto_hide(should_hide);
+                }
+                if let Some(sb) = &mut self.right_sidebar {
+                    changed |= sb.apply_auto_hide(should_hide);
+                }
+            }
+            SidebarScope::Workspace => {
+                // Active workspace uses the current should_hide; others clear auto-hide.
+                let idx = self.active_workspace_idx;
+                for (i, ws) in self.workspaces.iter_mut().enumerate() {
+                    let hide = should_hide && i == idx;
+                    if let Some(sb) = ws.left_sidebar.as_mut() {
+                        changed |= sb.apply_auto_hide(hide);
+                    }
+                    if let Some(sb) = ws.right_sidebar.as_mut() {
+                        changed |= sb.apply_auto_hide(hide);
+                    }
+                }
+            }
+        }
+
+        if changed {
+            self.sync_sidebar_insets();
+        }
+    }
+
+    /// Sync reserve-mode insets onto the active workspace (and all workspaces for output scope).
+    ///
+    /// Main-strip tile sizes update without `window-resize` so they lockstep with the sidebar
+    /// spring (open/close, discrete width, and interactive edge resize). Animated configures
+    /// would restart `Tile::ResizeAnimation` every frame and fight the moving inset.
+    pub fn sync_sidebar_insets(&mut self) {
+        let scope = self.sidebar_scope();
+        let left = match scope {
+            SidebarScope::Output => self
+                .left_sidebar
+                .as_ref()
+                .map(|s| s.reserved_inset())
+                .unwrap_or(0.),
+            SidebarScope::Workspace => 0.,
+        };
+        let right = match scope {
+            SidebarScope::Output => self
+                .right_sidebar
+                .as_ref()
+                .map(|s| s.reserved_inset())
+                .unwrap_or(0.),
+            SidebarScope::Workspace => 0.,
+        };
+
+        for (idx, ws) in self.workspaces.iter_mut().enumerate() {
+            let (l, r) = if scope == SidebarScope::Workspace {
+                let l = ws
+                    .left_sidebar
+                    .as_ref()
+                    .map(|s| s.reserved_inset())
+                    .unwrap_or(0.);
+                let r = ws
+                    .right_sidebar
+                    .as_ref()
+                    .map(|s| s.reserved_inset())
+                    .unwrap_or(0.);
+                // Only the active workspace's sidebars affect layout when scoped to workspace;
+                // inactive ones keep their own insets for when they become active.
+                if idx == self.active_workspace_idx {
+                    (l, r)
+                } else {
+                    (l, r)
+                }
+            } else {
+                (left, right)
+            };
+            ws.set_sidebar_insets(l, r);
+        }
+    }
+
+    pub fn move_window_to_scratchpad(&mut self, window: Option<&W::Id>) -> bool {
+        let id = match window {
+            Some(id) => id.clone(),
+            None => {
+                let Some(win) = self.active_window() else {
+                    return false;
+                };
+                win.id().clone()
+            }
+        };
+
+        if self.scratchpad.contains(&id) {
+            return false;
+        }
+
+        // Remove from sidebars or workspaces.
+        let removed = if self.left_sidebar.as_ref().is_some_and(|s| s.contains(&id)) {
+            self.left_sidebar.as_mut().unwrap().remove(&id)
+        } else if self.right_sidebar.as_ref().is_some_and(|s| s.contains(&id)) {
+            self.right_sidebar.as_mut().unwrap().remove(&id)
+        } else {
+            self.workspaces
+                .iter_mut()
+                .find(|ws| ws.has_window(&id))
+                .map(|ws| ws.remove_tile(&id, Transaction::new()))
+        };
+
+        let Some(removed) = removed else {
+            return false;
+        };
+
+        if self.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.left_sidebar = None;
+            if self.sidebar_focus == Some(SidebarSide::Left) {
+                self.sidebar_focus = None;
+            }
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.right_sidebar = None;
+            if self.sidebar_focus == Some(SidebarSide::Right) {
+                self.sidebar_focus = None;
+            }
+        }
+
+        self.scratchpad.push(removed);
+        self.sync_sidebar_insets();
+        true
+    }
+
+    pub fn toggle_scratchpad(&mut self) {
+        self.scratchpad.toggle();
+    }
+
+    pub fn cycle_scratchpad(&mut self, forward: bool) {
+        self.scratchpad.cycle(forward);
+    }
+
+    pub fn move_window_to_sidebar(&mut self, side: SidebarSide, window: Option<&W::Id>) -> bool {
+        let id = match window {
+            Some(id) => id.clone(),
+            None => {
+                let Some(win) = self.active_window() else {
+                    return false;
+                };
+                win.id().clone()
+            }
+        };
+
+        // Same-side repeat toggles the window back out of the sidebar.
+        let already = match self.sidebar_scope() {
+            SidebarScope::Output => self
+                .output_sidebar_mut(side)
+                .as_ref()
+                .is_some_and(|s| s.contains(&id)),
+            SidebarScope::Workspace => self
+                .active_workspace_ref()
+                .sidebar(side)
+                .is_some_and(|s| s.contains(&id)),
+        };
+        if already {
+            return self.move_window_out_of_sidebar(Some(&id));
+        }
+
+        let removed = self.remove_window_for_sidebar(&id);
+        let Some(removed) = removed else {
+            return false;
+        };
+
+        let output = self.output.clone();
+        match self.sidebar_scope() {
+            SidebarScope::Output => {
+                let sb = self.ensure_output_sidebar(side);
+                sb.push(removed);
+                // remove_tile may have called output_leave; re-attach to this monitor.
+                sb.update_output(&output);
+            }
+            SidebarScope::Workspace => {
+                let sb = self.active_workspace().ensure_sidebar(side);
+                sb.push(removed);
+                sb.update_output(&output);
+            }
+        }
+        self.sync_sidebar_insets();
+        true
+    }
+
+    fn remove_window_for_sidebar(&mut self, id: &W::Id) -> Option<RemovedTile<W>> {
+        if self.scratchpad.contains(id) {
+            return self.scratchpad.remove(id);
+        }
+        if self.left_sidebar.as_ref().is_some_and(|s| s.contains(id)) {
+            let removed = self.left_sidebar.as_mut().unwrap().remove(id);
+            if self.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+                self.left_sidebar = None;
+            }
+            return removed;
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.contains(id)) {
+            let removed = self.right_sidebar.as_mut().unwrap().remove(id);
+            if self.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+                self.right_sidebar = None;
+            }
+            return removed;
+        }
+        for ws in &mut self.workspaces {
+            if ws.has_window(id) {
+                // Also check workspace sidebars via remove_tile
+                return Some(ws.remove_tile(id, Transaction::new()));
+            }
+        }
+        None
+    }
+
+    pub fn move_window_out_of_sidebar(&mut self, window: Option<&W::Id>) -> bool {
+        let id = match window {
+            Some(id) => id.clone(),
+            None => {
+                let Some(win) = self.active_window() else {
+                    return false;
+                };
+                win.id().clone()
+            }
+        };
+
+        let removed = if self.left_sidebar.as_ref().is_some_and(|s| s.contains(&id)) {
+            self.left_sidebar.as_mut().unwrap().remove(&id)
+        } else if self.right_sidebar.as_ref().is_some_and(|s| s.contains(&id)) {
+            self.right_sidebar.as_mut().unwrap().remove(&id)
+        } else {
+            let ws = self.active_workspace();
+            if ws.left_sidebar.as_ref().is_some_and(|s| s.contains(&id)) {
+                ws.left_sidebar.as_mut().unwrap().remove(&id)
+            } else if ws.right_sidebar.as_ref().is_some_and(|s| s.contains(&id)) {
+                ws.right_sidebar.as_mut().unwrap().remove(&id)
+            } else {
+                None
+            }
+        };
+
+        let Some(removed) = removed else {
+            return false;
+        };
+
+        if self.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.left_sidebar = None;
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.right_sidebar = None;
+        }
+
+        self.active_workspace().add_tile(
+            removed.tile,
+            WorkspaceAddWindowTarget::Auto,
+            ActivateWindow::Yes,
+            removed.width,
+            removed.is_full_width,
+            false,
+        );
+        self.sidebar_focus = None;
+        self.sync_sidebar_insets();
+        true
+    }
+
+    pub fn toggle_sidebar(&mut self, side: SidebarSide) {
+        match self.sidebar_scope() {
+            SidebarScope::Output => {
+                if let Some(sb) = self.output_sidebar_mut(side).as_mut() {
+                    sb.toggle_visible();
+                    if !sb.is_visible() && self.sidebar_focus == Some(side) {
+                        self.sidebar_focus = None;
+                    }
+                }
+            }
+            SidebarScope::Workspace => {
+                if let Some(sb) = self.active_workspace().sidebar_mut(side).as_mut() {
+                    sb.toggle_visible();
+                    if !sb.is_visible() {
+                        sb.set_focused(false);
+                    }
+                }
+            }
+        }
+        self.sync_sidebar_insets();
+    }
+
+    pub fn focus_sidebar(&mut self, side: SidebarSide) {
+        match self.sidebar_scope() {
+            SidebarScope::Output => {
+                let has = self
+                    .output_sidebar_mut(side)
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty());
+                if !has {
+                    return;
+                }
+                if let Some(sb) = self.left_sidebar.as_mut() {
+                    sb.set_focused(side == SidebarSide::Left);
+                    if side == SidebarSide::Left {
+                        sb.reveal_for_user();
+                    }
+                }
+                if let Some(sb) = self.right_sidebar.as_mut() {
+                    sb.set_focused(side == SidebarSide::Right);
+                    if side == SidebarSide::Right {
+                        sb.reveal_for_user();
+                    }
+                }
+                self.sidebar_focus = Some(side);
+                self.active_workspace().clear_sidebar_focus();
+                self.active_workspace().focus_tiling();
+            }
+            SidebarScope::Workspace => {
+                let other = match side {
+                    SidebarSide::Left => SidebarSide::Right,
+                    SidebarSide::Right => SidebarSide::Left,
+                };
+                {
+                    let ws = self.active_workspace();
+                    if ws.sidebar(side).is_none_or(|s| s.is_empty()) {
+                        return;
+                    }
+                    if let Some(sb) = ws.sidebar_mut(other).as_mut() {
+                        sb.set_focused(false);
+                    }
+                    if let Some(sb) = ws.sidebar_mut(side).as_mut() {
+                        sb.reveal_for_user();
+                        sb.set_focused(true);
+                    }
+                    ws.focus_tiling();
+                }
+                self.sidebar_focus = None;
+            }
+        }
+        self.sync_sidebar_insets();
+    }
+
+    pub fn clear_output_sidebar_focus(&mut self) {
+        self.sidebar_focus = None;
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.set_focused(false);
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.set_focused(false);
+        }
     }
 
     pub fn add_workspace_at(&mut self, idx: usize) {
@@ -480,6 +960,8 @@ impl<W: LayoutElement> Monitor<W> {
                 )));
             }
         }
+
+        self.update_sidebar_auto_hide();
     }
 
     pub(super) fn resolve_add_window_target<'a>(
@@ -759,25 +1241,135 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_down_or_to_workspace_down(&mut self) {
-        if !self.active_workspace().move_down() {
+        if let Some(side) = self.sidebar_focus {
+            match side {
+                SidebarSide::Left => {
+                    if let Some(sb) = self.left_sidebar.as_mut() {
+                        sb.move_down();
+                    }
+                }
+                SidebarSide::Right => {
+                    if let Some(sb) = self.right_sidebar.as_mut() {
+                        sb.move_down();
+                    }
+                }
+            }
+            return;
+        }
+
+        let moved = {
+            let ws = self.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_down();
+                return;
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_down();
+                return;
+            }
+            ws.move_down()
+        };
+        if !moved {
             self.move_to_workspace_down(true);
         }
     }
 
     pub fn move_up_or_to_workspace_up(&mut self) {
-        if !self.active_workspace().move_up() {
+        if let Some(side) = self.sidebar_focus {
+            match side {
+                SidebarSide::Left => {
+                    if let Some(sb) = self.left_sidebar.as_mut() {
+                        sb.move_up();
+                    }
+                }
+                SidebarSide::Right => {
+                    if let Some(sb) = self.right_sidebar.as_mut() {
+                        sb.move_up();
+                    }
+                }
+            }
+            return;
+        }
+
+        let moved = {
+            let ws = self.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_up();
+                return;
+            }
+            if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.move_up();
+                return;
+            }
+            ws.move_up()
+        };
+        if !moved {
             self.move_to_workspace_up(true);
         }
     }
 
     pub fn focus_window_or_workspace_down(&mut self) {
-        if !self.active_workspace().focus_down() {
+        if let Some(side) = self.sidebar_focus {
+            let moved = match side {
+                SidebarSide::Left => self
+                    .left_sidebar
+                    .as_mut()
+                    .is_some_and(|sb| sb.focus_down()),
+                SidebarSide::Right => self
+                    .right_sidebar
+                    .as_mut()
+                    .is_some_and(|sb| sb.focus_down()),
+            };
+            if !moved {
+                self.switch_workspace_down();
+            }
+            return;
+        }
+
+        let moved = {
+            let ws = self.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.focus_down()
+            } else if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.focus_down()
+            } else {
+                ws.focus_down()
+            }
+        };
+        if !moved {
             self.switch_workspace_down();
         }
     }
 
     pub fn focus_window_or_workspace_up(&mut self) {
-        if !self.active_workspace().focus_up() {
+        if let Some(side) = self.sidebar_focus {
+            let moved = match side {
+                SidebarSide::Left => self
+                    .left_sidebar
+                    .as_mut()
+                    .is_some_and(|sb| sb.focus_up()),
+                SidebarSide::Right => self
+                    .right_sidebar
+                    .as_mut()
+                    .is_some_and(|sb| sb.focus_up()),
+            };
+            if !moved {
+                self.switch_workspace_up();
+            }
+            return;
+        }
+
+        let moved = {
+            let ws = self.active_workspace();
+            if let Some(sb) = ws.left_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.focus_up()
+            } else if let Some(sb) = ws.right_sidebar.as_mut().filter(|s| s.is_focused()) {
+                sb.focus_up()
+            } else {
+                ws.focus_up()
+            }
+        };
+        if !moved {
             self.switch_workspace_up();
         }
     }
@@ -1031,10 +1623,46 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn active_window(&self) -> Option<&W> {
+        if let Some(side) = self.sidebar_focus {
+            let sb = match side {
+                SidebarSide::Left => self.left_sidebar.as_ref(),
+                SidebarSide::Right => self.right_sidebar.as_ref(),
+            };
+            if let Some(win) = sb.and_then(|s| s.active_window()) {
+                return Some(win);
+            }
+        }
+        if let Some(id) = self.scratchpad.shown_id() {
+            if let Some(win) = self.scratchpad.windows().find(|w| w.id() == id) {
+                // Prefer scratchpad overlay focus only when explicitly activated via activate;
+                // otherwise fall through. Shown scratchpad does not steal focus by default.
+                let _ = win;
+            }
+        }
         self.active_workspace_ref().active_window()
     }
 
     pub fn advance_animations(&mut self) {
+        self.scratchpad.advance_animations();
+        let mut sidebar_needs_inset_sync = false;
+        if let Some(sb) = &mut self.left_sidebar {
+            // Sync on the completion frame too (needs_inset_sync becomes false after advance).
+            sidebar_needs_inset_sync |= sb.needs_inset_sync();
+            sb.advance_animations();
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sidebar_needs_inset_sync |= sb.needs_inset_sync();
+            sb.advance_animations();
+        }
+        if self.left_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.left_sidebar = None;
+            sidebar_needs_inset_sync = true;
+        }
+        if self.right_sidebar.as_ref().is_some_and(|s| s.can_discard()) {
+            self.right_sidebar = None;
+            sidebar_needs_inset_sync = true;
+        }
+
         match &mut self.workspace_switch {
             Some(WorkspaceSwitch::Animation(anim)) => {
                 if anim.is_done() {
@@ -1070,7 +1698,12 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         for ws in &mut self.workspaces {
+            sidebar_needs_inset_sync |= ws.sidebar_needs_inset_sync();
             ws.advance_animations();
+        }
+
+        if sidebar_needs_inset_sync {
+            self.sync_sidebar_insets();
         }
     }
 
@@ -1078,6 +1711,15 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
+            || self.scratchpad.are_animations_ongoing()
+            || self
+                .left_sidebar
+                .as_ref()
+                .is_some_and(|s| s.are_animations_ongoing())
+            || self
+                .right_sidebar
+                .as_ref()
+                .is_some_and(|s| s.are_animations_ongoing())
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
@@ -1104,12 +1746,28 @@ impl<W: LayoutElement> Monitor<W> {
             }
         }
 
+        let sidebar_focused = self.sidebar_focus.is_some();
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.update_render_elements(is_active && sidebar_focused);
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.update_render_elements(is_active && sidebar_focused);
+        }
+        self.scratchpad
+            .update_render_elements(is_active && self.scratchpad.shown_id().is_some());
+
         self.insert_hint_render_loc = None;
         if let Some(hint) = &self.insert_hint {
             match hint.workspace {
                 InsertWorkspace::Existing(ws_id) => {
                     if let Some(ws) = self.workspaces.iter().find(|ws| ws.id() == ws_id) {
-                        if let Some(mut area) = ws.insert_hint_area(hint.position) {
+                        let area = match hint.position {
+                            InsertPosition::Sidebar(side) => {
+                                Some(self.sidebar_insert_hint_area(side, ws))
+                            }
+                            other => ws.insert_hint_area(other),
+                        };
+                        if let Some(mut area) = area {
                             let scale = ws.scale().fractional_scale();
                             let view_size = ws.view_size();
 
@@ -1128,6 +1786,9 @@ impl<W: LayoutElement> Monitor<W> {
                             area = area.to_physical_precise_round(scale).to_logical(scale);
 
                             let view_rect = Rectangle::new(area.loc.upscale(-1.), view_size);
+                            let fixed_to_output = matches!(hint.position, InsertPosition::Sidebar(_))
+                                && self.sidebar_scope() == SidebarScope::Output;
+
                             self.insert_hint_element.update_render_elements(
                                 area.size,
                                 view_rect,
@@ -1137,6 +1798,8 @@ impl<W: LayoutElement> Monitor<W> {
                             self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                                 workspace: hint.workspace,
                                 location: area.loc,
+                                size: area.size,
+                                fixed_to_output,
                             });
                         }
                     } else {
@@ -1177,15 +1840,188 @@ impl<W: LayoutElement> Monitor<W> {
                     self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                         workspace: hint.workspace,
                         location: hint_loc,
+                        size: hint_size,
+                        fixed_to_output: false,
                     });
                 }
             }
         }
     }
 
+    fn sidebar_for<'a>(
+        &'a self,
+        side: SidebarSide,
+        ws: &'a Workspace<W>,
+    ) -> Option<&'a Sidebar<W>> {
+        match self.sidebar_scope() {
+            SidebarScope::Output => match side {
+                SidebarSide::Left => self.left_sidebar.as_ref(),
+                SidebarSide::Right => self.right_sidebar.as_ref(),
+            },
+            SidebarScope::Workspace => match side {
+                SidebarSide::Left => ws.left_sidebar.as_ref(),
+                SidebarSide::Right => ws.right_sidebar.as_ref(),
+            },
+        }
+    }
+
+    /// Drop-zone rectangle for a sidebar insert hint, in workspace view coordinates
+    /// when the sidebar does not exist yet; otherwise the live panel rect (output space).
+    pub(crate) fn sidebar_drop_rect(
+        &self,
+        side: SidebarSide,
+        ws: &Workspace<W>,
+    ) -> Rectangle<f64, Logical> {
+        if let Some(sb) = self.sidebar_for(side, ws) {
+            return sb.panel_rect();
+        }
+
+        let view = ws.view_size();
+        let preset = self
+            .options
+            .layout
+            .sidebar
+            .preset_widths
+            .first()
+            .copied()
+            .unwrap_or(PresetSize::Proportion(0.25));
+        let width = match preset {
+            PresetSize::Proportion(p) => (view.w * p).clamp(32., view.w * 0.8),
+            PresetSize::Fixed(px) => (px as f64).clamp(32., view.w * 0.8),
+        };
+        let x = match side {
+            SidebarSide::Left => 0.,
+            SidebarSide::Right => view.w - width,
+        };
+        Rectangle::new(Point::from((x, 0.)), Size::from((width, view.h)))
+    }
+
+    fn sidebar_insert_hint_area(
+        &self,
+        side: SidebarSide,
+        ws: &Workspace<W>,
+    ) -> Rectangle<f64, Logical> {
+        self.sidebar_drop_rect(side, ws)
+    }
+
+    /// Thin output-edge strip used to dock into a sidebar that is not open yet.
+    pub(crate) fn sidebar_edge_strip_rect(&self, side: SidebarSide) -> Rectangle<f64, Logical> {
+        let trigger = self.options.gestures.sidebar_edge_drop.trigger_width;
+        let w = self.view_size.w;
+        let h = self.view_size.h;
+        match side {
+            SidebarSide::Left => Rectangle::new(Point::from((0., 0.)), Size::from((trigger, h))),
+            SidebarSide::Right => {
+                Rectangle::new(Point::from((w - trigger, 0.)), Size::from((trigger, h)))
+            }
+        }
+    }
+
+    /// Zone the pointer must leave before re-docking via the edge strip after dragging out.
+    ///
+    /// When the origin sidebar is still open, this is the full panel (output space for output
+    /// scope; caller must transform for workspace scope). When closed/absent, the edge strip.
+    pub(crate) fn sidebar_origin_latch_rect(
+        &self,
+        side: SidebarSide,
+        ws: &Workspace<W>,
+    ) -> Rectangle<f64, Logical> {
+        self.open_sidebar_panel_in_output_space(side, ws)
+            .unwrap_or_else(|| self.sidebar_edge_strip_rect(side))
+    }
+
+    /// Live panel geometry in output / pointer space for an open sidebar on `side`.
+    pub(crate) fn open_sidebar_panel_in_output_space(
+        &self,
+        side: SidebarSide,
+        ws: &Workspace<W>,
+    ) -> Option<Rectangle<f64, Logical>> {
+        let (panel, ws_id) = {
+            let sb = self.sidebar_for(side, ws)?;
+            if sb.open_progress() <= 0. {
+                return None;
+            }
+            (sb.panel_rect(), ws.id())
+        };
+        match self.sidebar_scope() {
+            SidebarScope::Output => Some(panel),
+            SidebarScope::Workspace => {
+                // Workspace sidebars zoom with the card; map into output space.
+                let zoom = self.overview_zoom();
+                let Some(geo) = self
+                    .workspaces_with_render_geo()
+                    .find(|(w, _)| w.id() == ws_id)
+                    .map(|(_, geo)| geo)
+                else {
+                    return Some(panel);
+                };
+                Some(Rectangle::new(
+                    geo.loc + panel.loc.upscale(zoom),
+                    panel.size.upscale(zoom),
+                ))
+            }
+        }
+    }
+
+    /// True when the pointer is over an on-screen sidebar panel (not the closed/slid-off rect).
+    fn pointer_in_sidebar_panel(
+        &self,
+        pos: Point<f64, Logical>,
+        side: SidebarSide,
+        ws: &Workspace<W>,
+    ) -> bool {
+        self.open_sidebar_panel_in_output_space(side, ws)
+            .is_some_and(|panel| panel.contains(pos))
+    }
+
+    /// `origin_panel_rect` is the origin sidebar panel in output space, captured before
+    /// discarding an emptied sidebar when dragging its last window out.
+    pub(crate) fn sidebar_drop_at(
+        &self,
+        pos: Point<f64, Logical>,
+        ws: &Workspace<W>,
+        from_sidebar: Option<SidebarSide>,
+        left_origin_edge: bool,
+        origin_panel_rect: Option<Rectangle<f64, Logical>>,
+    ) -> Option<SidebarSide> {
+        for side in [SidebarSide::Left, SidebarSide::Right] {
+            if self.pointer_in_sidebar_panel(pos, side, ws) {
+                return Some(side);
+            }
+            // Last window dragged out: sidebar Option is gone, but keep the former panel hittable.
+            if from_sidebar == Some(side) {
+                if let Some(rect) = origin_panel_rect {
+                    if rect.contains(pos) {
+                        return Some(side);
+                    }
+                }
+            }
+        }
+
+        let w = self.view_size.w;
+        let x = pos.x;
+        let trigger = self.options.gestures.sidebar_edge_drop.trigger_width;
+        let mut sidebar_drop = if x < trigger {
+            Some(SidebarSide::Left)
+        } else if w - x < trigger {
+            Some(SidebarSide::Right)
+        } else {
+            None
+        };
+        if let Some(side) = sidebar_drop {
+            if from_sidebar == Some(side) && !left_origin_edge {
+                sidebar_drop = None;
+            }
+        }
+        sidebar_drop
+    }
+
     pub fn update_config(&mut self, base_options: Rc<Options>) {
         let options =
             Rc::new(Options::clone(&base_options).with_merged_layout(self.layout_config.as_ref()));
+
+        let old_scope = self.options.layout.sidebar.scope;
+        let new_scope = options.layout.sidebar.scope;
 
         if self.options.layout.empty_workspace_above_first
             != options.layout.empty_workspace_above_first
@@ -1206,8 +2042,95 @@ impl<W: LayoutElement> Monitor<W> {
         self.insert_hint_element
             .update_config(options.layout.insert_hint);
 
+        let scale = self.scale.fractional_scale();
+        self.scratchpad.update_config(
+            self.view_size,
+            self.working_area,
+            scale,
+            options.clone(),
+        );
+
         self.base_options = base_options;
         self.options = options;
+
+        if old_scope != new_scope {
+            self.migrate_sidebar_scope(old_scope, new_scope);
+        }
+
+        let left_mode = self.sidebar_mode_for(SidebarSide::Left);
+        let right_mode = self.sidebar_mode_for(SidebarSide::Right);
+        let options = self.options.clone();
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.update_config(
+                self.view_size,
+                self.working_area,
+                scale,
+                options.clone(),
+                left_mode,
+            );
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.update_config(
+                self.view_size,
+                self.working_area,
+                scale,
+                options,
+                right_mode,
+            );
+        }
+
+        self.update_sidebar_auto_hide();
+        self.sync_sidebar_insets();
+    }
+
+    /// Move sidebar windows between monitor and workspace stores when scope changes on reload.
+    fn migrate_sidebar_scope(&mut self, from: SidebarScope, to: SidebarScope) {
+        let output = self.output.clone();
+        match (from, to) {
+            (SidebarScope::Output, SidebarScope::Workspace) => {
+                for side in [SidebarSide::Left, SidebarSide::Right] {
+                    let taken = match side {
+                        SidebarSide::Left => self.left_sidebar.take(),
+                        SidebarSide::Right => self.right_sidebar.take(),
+                    };
+                    let Some(mut sb) = taken else {
+                        continue;
+                    };
+                    let tiles = sb.take_all();
+                    if tiles.is_empty() {
+                        continue;
+                    }
+                    let ws_sb = self.active_workspace().ensure_sidebar(side);
+                    for removed in tiles {
+                        ws_sb.push(removed);
+                    }
+                    ws_sb.update_output(&output);
+                }
+                self.sidebar_focus = None;
+            }
+            (SidebarScope::Workspace, SidebarScope::Output) => {
+                for side in [SidebarSide::Left, SidebarSide::Right] {
+                    let mut collected = Vec::new();
+                    for ws in &mut self.workspaces {
+                        if let Some(mut sb) = ws.sidebar_mut(side).take() {
+                            collected.extend(sb.take_all());
+                        }
+                    }
+                    if collected.is_empty() {
+                        continue;
+                    }
+                    let sb = self.ensure_output_sidebar(side);
+                    for removed in collected {
+                        sb.push(removed);
+                    }
+                    sb.update_output(&output);
+                }
+                for ws in &mut self.workspaces {
+                    ws.clear_sidebar_focus();
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) -> bool {
@@ -1237,6 +2160,39 @@ impl<W: LayoutElement> Monitor<W> {
         for ws in &mut self.workspaces {
             ws.update_output_size();
         }
+
+        let scale = self.scale.fractional_scale();
+        self.scratchpad.update_config(
+            self.view_size,
+            self.working_area,
+            scale,
+            self.options.clone(),
+        );
+        self.scratchpad.update_output(&self.output);
+
+        let left_mode = self.sidebar_mode_for(SidebarSide::Left);
+        let right_mode = self.sidebar_mode_for(SidebarSide::Right);
+        if let Some(sb) = &mut self.left_sidebar {
+            sb.update_config(
+                self.view_size,
+                self.working_area,
+                scale,
+                self.options.clone(),
+                left_mode,
+            );
+            sb.update_output(&self.output);
+        }
+        if let Some(sb) = &mut self.right_sidebar {
+            sb.update_config(
+                self.view_size,
+                self.working_area,
+                scale,
+                self.options.clone(),
+                right_mode,
+            );
+            sb.update_output(&self.output);
+        }
+        self.sync_sidebar_insets();
     }
 
     pub fn move_workspace_down(&mut self) {
@@ -1350,7 +2306,21 @@ impl<W: LayoutElement> Monitor<W> {
             return None;
         }
 
+        if let Some(side) = self.sidebar_focus {
+            let sb = match side {
+                SidebarSide::Left => self.left_sidebar.as_ref(),
+                SidebarSide::Right => self.right_sidebar.as_ref(),
+            };
+            if let Some(rect) = sb.and_then(|s| s.active_window_visual_rectangle()) {
+                return Some(rect);
+            }
+        }
+
         self.active_workspace_ref().active_window_visual_rectangle()
+    }
+
+    fn overview_axis(&self) -> AxisMap {
+        self.active_workspace_ref().axis()
     }
 
     fn workspace_size(&self, zoom: f64) -> Size<f64, Logical> {
@@ -1361,13 +2331,14 @@ impl<W: LayoutElement> Monitor<W> {
 
     fn workspace_gap(&self, zoom: f64) -> f64 {
         let scale = self.scale.fractional_scale();
-        let gap = self.view_size.h * 0.1 * zoom;
+        let gap = self.overview_axis().size_cross(self.view_size) * 0.1 * zoom;
         round_logical_in_physical_max1(scale, gap)
     }
 
-    fn workspace_size_with_gap(&self, zoom: f64) -> Size<f64, Logical> {
-        let gap = self.workspace_gap(zoom);
-        self.workspace_size(zoom) + Size::from((0., gap))
+    /// Distance from one workspace to the next, along the axis perpendicular to the tiling strip.
+    fn workspace_switch_span(&self, zoom: f64) -> f64 {
+        let ws_size = self.workspace_size(zoom);
+        self.overview_axis().size_cross(ws_size) + self.workspace_gap(zoom)
     }
 
     pub fn overview_zoom(&self) -> f64 {
@@ -1452,10 +2423,10 @@ impl<W: LayoutElement> Monitor<W> {
                 // - first_y = -switch_anim.value() * from_height + to * (from_height - current_height)
                 let from = progress_anim.from();
                 let from_zoom = compute_overview_zoom(&self.options, Some(from));
-                let from_ws_height_with_gap = self.workspace_size_with_gap(from_zoom).h;
+                let from_ws_height_with_gap = self.workspace_switch_span(from_zoom);
 
                 let zoom = self.overview_zoom();
-                let ws_height_with_gap = self.workspace_size_with_gap(zoom).h;
+                let ws_height_with_gap = self.workspace_switch_span(zoom);
 
                 let first_ws_y = -switch_anim.value() * from_ws_height_with_gap
                     + switch_anim.to() * (from_ws_height_with_gap - ws_height_with_gap);
@@ -1471,26 +2442,34 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// Render geometry of the active workspace card (uncullled).
+    ///
+    /// Prefer this over `workspaces_with_render_geo().nth(active_workspace_idx)`: the culled
+    /// iterator only contains on-screen cards, so absolute indices ≥ 1 often miss after a switch.
+    pub fn active_workspace_render_geo(&self) -> Option<Rectangle<f64, Logical>> {
+        self.workspaces_render_geo().nth(self.active_workspace_idx)
+    }
+
     pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
 
         let ws_size = self.workspace_size(zoom);
-        let gap = self.workspace_gap(zoom);
-        let ws_height_with_gap = ws_size.h + gap;
+        let axis = self.overview_axis();
+        let ws_span = axis.size_cross(ws_size) + self.workspace_gap(zoom);
 
         let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
         let static_offset = static_offset
             .to_physical_precise_round(scale)
             .to_logical(scale);
 
-        let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
-        let first_ws_y = round_logical_in_physical(scale, first_ws_y);
+        let first_ws = -self.workspace_render_idx() * ws_span;
+        let first_ws = round_logical_in_physical(scale, first_ws);
 
         // Return position for one-past-last workspace too.
         (0..=self.workspaces.len()).map(move |idx| {
-            let y = first_ws_y + idx as f64 * ws_height_with_gap;
-            let loc = Point::from((0., y)) + static_offset;
+            let along = first_ws + idx as f64 * ws_span;
+            let loc = axis.cross_vec(along) + static_offset;
 
             // Even though all components that go into loc are rounded to physical pixels, the
             // floating point addition may lose precision. This can result for example in the
@@ -1541,9 +2520,18 @@ impl<W: LayoutElement> Monitor<W> {
         pos_within_output: Point<f64, Logical>,
     ) -> Option<(&Workspace<W>, Rectangle<f64, Logical>)> {
         let (ws, geo) = self.workspaces_with_render_geo().find_map(|(ws, geo)| {
-            // Extend width to entire output.
-            let loc = Point::from((0., geo.loc.y));
-            let size = Size::from((self.view_size.w, geo.size.h));
+            // Extend along the tiling strip so a workspace card catches the whole output.
+            let (loc, size) = if self.overview_axis().is_vertical() {
+                (
+                    Point::from((geo.loc.x, 0.)),
+                    Size::from((geo.size.w, self.view_size.h)),
+                )
+            } else {
+                (
+                    Point::from((0., geo.loc.y)),
+                    Size::from((self.view_size.w, geo.size.h)),
+                )
+            };
             let bounds = Rectangle::new(loc, size);
 
             bounds.contains(pos_within_output).then_some((ws, geo))
@@ -1560,6 +2548,18 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
+        // Output-scoped sidebars stay in screen space (including during overview).
+        if let Some(sb) = &self.left_sidebar {
+            if let Some(rv) = sb.window_under(pos_within_output) {
+                return Some(rv);
+            }
+        }
+        if let Some(sb) = &self.right_sidebar {
+            if let Some(rv) = sb.window_under(pos_within_output) {
+                return Some(rv);
+            }
+        }
+
         let (ws, geo) = self.workspace_under(pos_within_output)?;
 
         if self.overview_progress.is_some() {
@@ -1570,7 +2570,14 @@ impl<W: LayoutElement> Monitor<W> {
             // represent scaled windows properly.
             Some((win, hit.to_activate()))
         } else {
-            let (win, hit) = ws.window_under(pos_within_output - geo.loc)?;
+            let pos = pos_within_output - geo.loc;
+
+            // Scratchpad overlay above workspace contents.
+            if let Some(rv) = self.scratchpad.window_under(pos) {
+                return Some((rv.0, rv.1.offset_win_pos(geo.loc)));
+            }
+
+            let (win, hit) = ws.window_under(pos)?;
             Some((win, hit.offset_win_pos(geo.loc)))
         }
     }
@@ -1581,7 +2588,40 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         let (ws, geo) = self.workspace_under(pos_within_output)?;
-        ws.resize_edges_under(pos_within_output - geo.loc)
+        let pos = pos_within_output - geo.loc;
+
+        if let Some(sb) = &self.left_sidebar {
+            if let Some(edges) = sb.resize_edges_under(pos) {
+                return Some(edges);
+            }
+        }
+        if let Some(sb) = &self.right_sidebar {
+            if let Some(edges) = sb.resize_edges_under(pos) {
+                return Some(edges);
+            }
+        }
+        if let Some(sb) = &ws.left_sidebar {
+            if let Some(edges) = sb.resize_edges_under(pos) {
+                return Some(edges);
+            }
+        }
+        if let Some(sb) = &ws.right_sidebar {
+            if let Some(edges) = sb.resize_edges_under(pos) {
+                return Some(edges);
+            }
+        }
+
+        ws.resize_edges_under(pos)
+    }
+
+    pub(super) fn workspace_for_insert<'a>(
+        &'a self,
+        insert_ws: InsertWorkspace,
+    ) -> Option<&'a Workspace<W>> {
+        match insert_ws {
+            InsertWorkspace::Existing(id) => self.workspaces.iter().find(|ws| ws.id() == id),
+            InsertWorkspace::NewAt(idx) => self.workspaces.get(idx),
+        }
     }
 
     pub(super) fn insert_position(
@@ -1720,6 +2760,72 @@ impl<W: LayoutElement> Monitor<W> {
             )
         };
 
+        // Push order is top-first (earlier push = higher in the stack), matching the rest of niri.
+        // Desired stack: output-scoped sidebar insert hint > output sidebars (screen-fixed) >
+        // scratchpad on active card > workspace sidebars > floating > insert hint > scrolling.
+        // Sidebar drop hints paint above open sidebar tiles so mid-panel targeting is visible.
+
+        // Output-scoped sidebars stay in screen space (like top/overlay layers), not zoomed
+        // with overview workspace cards.
+        {
+            let identity_relocate = |elem| {
+                let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), 1.);
+                RelocateRenderElement::from_element(elem, Point::from((0, 0)), Relocate::Relative)
+            };
+            macro_rules! push_sidebar_fixed {
+                () => {{
+                    &mut |elem: SidebarRenderElement<R>| {
+                        let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+                        if let Some(elem) = elem {
+                            let elem = MonitorInnerRenderElement::Sidebar(elem);
+                            push(identity_relocate(elem));
+                        }
+                    }
+                }};
+            }
+
+            // Output-scoped sidebar insert hint above the panel so open-sidebar drops are obvious.
+            if let Some(loc) = insert_hint_render_loc.filter(|l| l.fixed_to_output) {
+                self.insert_hint_element
+                    .render(ctx.renderer, loc.location, &mut |elem| {
+                        let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+                        if let Some(elem) = elem {
+                            let elem = MonitorInnerRenderElement::InsertHint(elem);
+                            push(identity_relocate(elem));
+                        }
+                    });
+            }
+
+            let xray_pos = XrayPos::default();
+            if let Some(sb) = &self.left_sidebar {
+                sb.render(ctx.r(), xray_pos, push_sidebar_fixed!());
+            }
+            if let Some(sb) = &self.right_sidebar {
+                sb.render(ctx.r(), xray_pos, push_sidebar_fixed!());
+            }
+        }
+
+        // Scratchpad stays on the active workspace card (including overview).
+        // Use uncullled geo by absolute index — culled `.nth(active_idx)` misses when idx ≥ 1.
+        if let Some(geo) = self.active_workspace_render_geo() {
+            let xray_pos = XrayPos::new(geo.loc, zoom);
+            macro_rules! push_tile {
+                () => {{
+                    &mut |elem: TileRenderElement<R>| {
+                        let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+                        if let Some(elem) = elem {
+                            let elem = MonitorInnerRenderElement::Tile(elem);
+                            push(scale_relocate(geo, elem));
+                        }
+                    }
+                }};
+            }
+
+            let scratch_focus = self.scratchpad.shown_id().is_some() && focus_ring;
+            self.scratchpad
+                .render(ctx.r(), xray_pos, scratch_focus, push_tile!());
+        }
+
         for (ws, geo) in self.workspaces_with_render_geo() {
             // Macro instead of closure because ws and insert hint have different elem types.
             macro_rules! push {
@@ -1736,10 +2842,11 @@ impl<W: LayoutElement> Monitor<W> {
 
             let xray_pos = XrayPos::new(geo.loc, zoom);
 
+            ws.render_sidebars(ctx.r(), xray_pos, push!());
             ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
 
             if let Some(loc) = insert_hint_render_loc {
-                if loc.workspace == InsertWorkspace::Existing(ws.id()) {
+                if !loc.fixed_to_output && loc.workspace == InsertWorkspace::Existing(ws.id()) {
                     self.insert_hint_element
                         .render(ctx.renderer, loc.location, push!());
                 }
@@ -1847,7 +2954,7 @@ impl<W: LayoutElement> Monitor<W> {
         let total_height = if gesture.is_touchpad {
             WORKSPACE_GESTURE_MOVEMENT
         } else {
-            self.workspace_size_with_gap(1.).h
+            self.workspace_switch_span(1.)
         };
 
         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
@@ -1981,7 +3088,7 @@ impl<W: LayoutElement> Monitor<W> {
         } else if gesture.is_touchpad {
             WORKSPACE_GESTURE_MOVEMENT
         } else {
-            self.workspace_size_with_gap(1.).h
+            self.workspace_switch_span(1.)
         };
 
         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {

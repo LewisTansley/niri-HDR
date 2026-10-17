@@ -40,6 +40,7 @@ pub mod layout;
 pub mod misc;
 pub mod output;
 pub mod recent_windows;
+pub mod sidebar;
 pub mod utils;
 pub mod window_rule;
 pub mod workspace;
@@ -57,6 +58,11 @@ pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+pub use crate::sidebar::{
+    sidebar_effective_default_column_width, ColumnWidthPair, ShortcutsSharing, Sidebar,
+    SidebarBorder, SidebarEdgeDrop, SidebarMode, SidebarPart, SidebarScope, SidebarShortcut,
+    SidebarSide, SidebarSideConfig,
+};
 pub use crate::utils::FloatOrInt;
 use crate::utils::{Flag, MergeWith as _};
 pub use crate::window_rule::{
@@ -1456,6 +1462,7 @@ mod tests {
                         },
                     ),
                 },
+                main_axis: Horizontal,
                 preset_column_widths: [
                     Proportion(
                         0.25,
@@ -1490,6 +1497,7 @@ mod tests {
                     ),
                 ],
                 center_focused_column: OnOverflow,
+                center_visible_columns: Never,
                 always_center_single_column: false,
                 empty_workspace_above_first: false,
                 default_column_display: Tabbed,
@@ -1513,6 +1521,57 @@ mod tests {
                     g: 0.25,
                     b: 0.25,
                     a: 1.0,
+                },
+                sidebar: Sidebar {
+                    scope: Output,
+                    mode: Reserve,
+                    preset_widths: [
+                        Proportion(
+                            0.2,
+                        ),
+                        Proportion(
+                            0.3,
+                        ),
+                        Proportion(
+                            0.4,
+                        ),
+                    ],
+                    left: SidebarSideConfig {
+                        mode: None,
+                        shortcuts: [],
+                    },
+                    right: SidebarSideConfig {
+                        mode: None,
+                        shortcuts: [],
+                    },
+                    border: SidebarBorder {
+                        off: true,
+                        width: 2.0,
+                        active_color: Color {
+                            r: 0.49803922,
+                            g: 0.78431374,
+                            b: 1.0,
+                            a: 1.0,
+                        },
+                        inactive_color: Color {
+                            r: 0.3137255,
+                            g: 0.3137255,
+                            b: 0.3137255,
+                            a: 1.0,
+                        },
+                        background_color: None,
+                    },
+                    corner_radius: None,
+                    use_dms_theme: false,
+                    hide_when_maximized: false,
+                    hide_when_fullscreen: false,
+                    shortcuts_sharing: PerSide,
+                    column_width_pairs: [],
+                    default_column_width_when_closed: None,
+                    default_column_width_when_open: None,
+                    keep_proportions_on_sidebar_inset: false,
+                    max_column_proportion_when_closed: None,
+                    min_column_proportion_when_open: None,
                 },
             },
             prefer_no_csd: true,
@@ -1678,6 +1737,18 @@ mod tests {
                         ),
                     },
                 ),
+                sidebar_open_close: SidebarOpenCloseAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                ),
             },
             blur: Blur {
                 off: false,
@@ -1696,6 +1767,10 @@ mod tests {
                     trigger_height: 50.0,
                     delay_ms: 100,
                     max_speed: 1500.0,
+                },
+                sidebar_edge_drop: SidebarEdgeDrop {
+                    trigger_width: 20.0,
+                    delay_ms: 150,
                 },
                 hot_corners: HotCorners {
                     off: false,
@@ -2460,6 +2535,134 @@ mod tests {
         }
 
         output
+    }
+
+    #[test]
+    fn parse_sidebar_shortcuts() {
+        let config = do_parse(
+            r#"
+            layout {
+                sidebar {
+                    left {
+                        shortcuts {
+                            shortcut app-id="spotify" title="Spotify" spawn="spotify"
+                            shortcut app-id="org.gnome.Calendar" spawn="gnome-calendar"
+                        }
+                    }
+                }
+            }
+            "#,
+        );
+        assert_eq!(config.layout.sidebar.left.shortcuts.len(), 2);
+        assert_eq!(config.layout.sidebar.left.shortcuts[0].app_id, "spotify");
+        assert_eq!(
+            config.layout.sidebar.left.shortcuts[0].title.as_deref(),
+            Some("Spotify")
+        );
+        assert_eq!(
+            config.layout.sidebar.left.shortcuts[0].spawn,
+            vec!["spotify".to_owned()]
+        );
+        assert_eq!(
+            config.layout.sidebar.left.shortcuts[1].app_id,
+            "org.gnome.Calendar"
+        );
+        assert!(config.layout.sidebar.right.shortcuts.is_empty());
+    }
+
+    #[test]
+    fn parse_sidebar_chrome() {
+        let config = do_parse(
+            r##"
+            layout {
+                sidebar {
+                    border {
+                        on
+                        width 3
+                        active-color "#ff0000"
+                        inactive-color "#00ff00"
+                        background-color "#0000ff80"
+                    }
+                    corner-radius 24
+                    use-dms-theme
+                    hide-when-maximized
+                    hide-when-fullscreen
+                }
+            }
+            "##,
+        );
+        let sidebar = &config.layout.sidebar;
+        assert!(!sidebar.border.off);
+        assert_eq!(sidebar.border.width, 3.);
+        assert_eq!(
+            sidebar.border.active_color,
+            Color::from_rgba8_unpremul(255, 0, 0, 255)
+        );
+        assert_eq!(
+            sidebar.border.inactive_color,
+            Color::from_rgba8_unpremul(0, 255, 0, 255)
+        );
+        assert_eq!(
+            sidebar.border.background_color,
+            Some(Color::from_rgba8_unpremul(0, 0, 255, 128))
+        );
+        assert_eq!(sidebar.corner_radius, Some(24.));
+        assert!(sidebar.use_dms_theme);
+        assert!(sidebar.hide_when_maximized);
+        assert!(sidebar.hide_when_fullscreen);
+    }
+
+    #[test]
+    fn parse_sidebar_column_width_pairs() {
+        let config = do_parse(
+            r#"
+            layout {
+                sidebar {
+                    column-width-pairs {
+                        pair {
+                            closed { proportion 0.5; }
+                            open { proportion 1.0; }
+                        }
+                        pair {
+                            closed { proportion 0.33333; }
+                            open { fixed 800; }
+                        }
+                    }
+                }
+            }
+            "#,
+        );
+        let pairs = &config.layout.sidebar.column_width_pairs;
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].closed, Some(PresetSize::Proportion(0.5)));
+        assert_eq!(pairs[0].open, Some(PresetSize::Proportion(1.0)));
+        assert_eq!(pairs[1].closed, Some(PresetSize::Proportion(0.33333)));
+        assert_eq!(pairs[1].open, Some(PresetSize::Fixed(800)));
+        assert_eq!(
+            sidebar_effective_default_column_width(&config.layout.sidebar, None, false),
+            Some(PresetSize::Proportion(0.5))
+        );
+        assert_eq!(
+            sidebar_effective_default_column_width(&config.layout.sidebar, None, true),
+            Some(PresetSize::Proportion(1.0))
+        );
+    }
+
+    #[test]
+    fn parse_sidebar_column_proportion_clamps() {
+        let config = do_parse(
+            r#"
+            layout {
+                sidebar {
+                    max-column-proportion-when-closed 0.5
+                    min-column-proportion-when-open 0.4
+                }
+            }
+            "#,
+        );
+        let sidebar = &config.layout.sidebar;
+        assert_eq!(sidebar.max_column_proportion_when_closed, Some(0.5));
+        assert_eq!(sidebar.min_column_proportion_when_open, Some(0.4));
     }
 
     #[test]

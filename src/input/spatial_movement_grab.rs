@@ -86,12 +86,13 @@ impl SpatialMovementGrab {
 
                 // Check if the gesture moved far enough to decide. Threshold copied from GTK 4.
                 if c.x * c.x + c.y * c.y >= 8. * 8. {
-                    if c.x.abs() > c.y.abs() {
+                    let (main, cross) = layout.map_gesture_delta(&self.output, c.x, c.y);
+                    if main.abs() > cross.abs() {
                         self.gesture = GestureState::ViewOffset;
                         if let Some((ws_idx, ws)) = layout.find_workspace_by_id(self.workspace_id) {
                             if ws.current_output() == Some(&self.output) {
                                 layout.view_offset_gesture_begin(&self.output, Some(ws_idx), false);
-                                layout.view_offset_gesture_update(-c.x, timestamp, false)
+                                layout.view_offset_gesture_update(-main, timestamp, false)
                             } else {
                                 None
                             }
@@ -101,17 +102,19 @@ impl SpatialMovementGrab {
                     } else {
                         self.gesture = GestureState::WorkspaceSwitch;
                         layout.workspace_switch_gesture_begin(&self.output, false);
-                        layout.workspace_switch_gesture_update(-c.y, timestamp, false)
+                        layout.workspace_switch_gesture_update(-cross, timestamp, false)
                     }
                 } else {
                     Some(None)
                 }
             }
             GestureState::ViewOffset => {
-                layout.view_offset_gesture_update(-delta.x, timestamp, false)
+                let (main, _) = layout.map_gesture_delta(&self.output, delta.x, delta.y);
+                layout.view_offset_gesture_update(-main, timestamp, false)
             }
             GestureState::WorkspaceSwitch => {
-                layout.workspace_switch_gesture_update(-delta.y, timestamp, false)
+                let (_, cross) = layout.map_gesture_delta(&self.output, delta.x, delta.y);
+                layout.workspace_switch_gesture_update(-cross, timestamp, false)
             }
         };
 

@@ -365,6 +365,30 @@ pub enum Action {
     ToggleOverview,
     OpenOverview,
     CloseOverview,
+    MoveWindowToScratchpad,
+    #[knuffel(skip)]
+    MoveWindowToScratchpadById(u64),
+    ToggleScratchpad,
+    CycleScratchpad,
+    CycleScratchpadBack,
+    MoveWindowToSidebarLeft,
+    #[knuffel(skip)]
+    MoveWindowToSidebarLeftById(u64),
+    MoveWindowToSidebarRight,
+    #[knuffel(skip)]
+    MoveWindowToSidebarRightById(u64),
+    MoveWindowOutOfSidebar,
+    #[knuffel(skip)]
+    MoveWindowOutOfSidebarById(u64),
+    ToggleSidebarLeft,
+    ToggleSidebarRight,
+    FocusSidebarLeft,
+    FocusSidebarRight,
+    SetSidebarWidth(#[knuffel(argument, str)] SizeChange),
+    ToggleSidebarShortcutsLeft,
+    ToggleSidebarShortcutsRight,
+    PinWindowToSidebarShortcutsLeft,
+    PinWindowToSidebarShortcutsRight,
     #[knuffel(skip)]
     ToggleWindowUrgent(u64),
     #[knuffel(skip)]
@@ -700,6 +724,40 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleOverview {} => Self::ToggleOverview,
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
+            niri_ipc::Action::MoveWindowToScratchpad { id: None } => Self::MoveWindowToScratchpad,
+            niri_ipc::Action::MoveWindowToScratchpad { id: Some(id) } => {
+                Self::MoveWindowToScratchpadById(id)
+            }
+            niri_ipc::Action::ToggleScratchpad {} => Self::ToggleScratchpad,
+            niri_ipc::Action::CycleScratchpad {} => Self::CycleScratchpad,
+            niri_ipc::Action::CycleScratchpadBack {} => Self::CycleScratchpadBack,
+            niri_ipc::Action::MoveWindowToSidebarLeft { id: None } => Self::MoveWindowToSidebarLeft,
+            niri_ipc::Action::MoveWindowToSidebarLeft { id: Some(id) } => {
+                Self::MoveWindowToSidebarLeftById(id)
+            }
+            niri_ipc::Action::MoveWindowToSidebarRight { id: None } => {
+                Self::MoveWindowToSidebarRight
+            }
+            niri_ipc::Action::MoveWindowToSidebarRight { id: Some(id) } => {
+                Self::MoveWindowToSidebarRightById(id)
+            }
+            niri_ipc::Action::MoveWindowOutOfSidebar { id: None } => Self::MoveWindowOutOfSidebar,
+            niri_ipc::Action::MoveWindowOutOfSidebar { id: Some(id) } => {
+                Self::MoveWindowOutOfSidebarById(id)
+            }
+            niri_ipc::Action::ToggleSidebarLeft {} => Self::ToggleSidebarLeft,
+            niri_ipc::Action::ToggleSidebarRight {} => Self::ToggleSidebarRight,
+            niri_ipc::Action::FocusSidebarLeft {} => Self::FocusSidebarLeft,
+            niri_ipc::Action::FocusSidebarRight {} => Self::FocusSidebarRight,
+            niri_ipc::Action::SetSidebarWidth { change } => Self::SetSidebarWidth(change),
+            niri_ipc::Action::ToggleSidebarShortcutsLeft {} => Self::ToggleSidebarShortcutsLeft,
+            niri_ipc::Action::ToggleSidebarShortcutsRight {} => Self::ToggleSidebarShortcutsRight,
+            niri_ipc::Action::PinWindowToSidebarShortcutsLeft {} => {
+                Self::PinWindowToSidebarShortcutsLeft
+            }
+            niri_ipc::Action::PinWindowToSidebarShortcutsRight {} => {
+                Self::PinWindowToSidebarShortcutsRight
+            }
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),

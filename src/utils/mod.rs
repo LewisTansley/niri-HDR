@@ -36,10 +36,13 @@ use wayland_backend::server::Credentials;
 use crate::handlers::KdeDecorationsModeState;
 use crate::niri::ClientState;
 
+pub mod desktop;
+pub mod dms_theme;
 pub mod id;
 pub mod region;
 pub mod scale;
 pub mod signals;
+pub mod sidebar_shortcuts_state;
 pub mod spawning;
 pub mod transaction;
 pub mod vblank_throttle;

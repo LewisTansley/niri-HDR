@@ -199,8 +199,12 @@ impl MoveGrab {
                     })
                     .unwrap_or(false);
 
+                let (main, cross) = data
+                    .niri
+                    .layout
+                    .map_gesture_delta(&self.start_output, c.x, c.y);
                 let is_view_offset =
-                    self.enable_view_offset && !is_floating && c.x.abs() > c.y.abs();
+                    self.enable_view_offset && !is_floating && main.abs() > cross.abs();
 
                 let started = if is_view_offset {
                     self.begin_view_offset(data)
@@ -241,8 +245,13 @@ impl MoveGrab {
                 }
             }
             GestureState::ViewOffset => {
+                let (main, _) = data.niri.layout.map_gesture_delta(
+                    &self.start_output,
+                    relative_delta.x,
+                    relative_delta.y,
+                );
                 let res = data.niri.layout.view_offset_gesture_update(
-                    -relative_delta.x,
+                    -main,
                     timestamp,
                     false,
                 );
